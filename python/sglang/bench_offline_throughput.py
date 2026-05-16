@@ -458,6 +458,12 @@ def throughput_test(
         return_logprob=bench_args.return_logprob,
         logprob_start_len=bench_args.logprob_start_len,
     )
+    
+    # Dump expert distribution records if enabled
+    if bench_args.backend == "engine" and hasattr(backend, 'dump_expert_distribution_record'):
+        logging.info("Dumping expert distribution records...")
+        backend.dump_expert_distribution_record()
+    
     backend.shutdown()
 
     if bench_args.result_filename:
