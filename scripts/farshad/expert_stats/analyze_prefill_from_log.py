@@ -64,10 +64,14 @@ def parse_log_file(log_file_path: Path) -> Dict:
                 # PT path is relative to parent of log file  
                 pt_path = (log_file_path.parent / pt_path_str).resolve()
         
+        # If path doesn't exist, try remapping /code/ docker path to host path
+        if not pt_path.exists() and '/code/' in pt_path_str:
+            host_base = Path('/data/farshad/github/vllm-llama-endpoints/closed/Intel/code/endpoints')
+            pt_path = (host_base / pt_path_str.replace('/code/', '', 1)).resolve()
         info['pt_file_path'] = pt_path
     else:
         raise ValueError(f"Could not find .pt file path in log: {log_file_path}")
-    
+
     # Extract dtype and quantization
     dtype_match = re.search(r"dtype='([^']*)'", content)
     if dtype_match:
@@ -182,21 +186,23 @@ def parse_log_file(log_file_path: Path) -> Dict:
     return info
 
 
-def simple_kmeans(data: np.ndarray, k: int, max_iters: int = 100) -> np.ndarray:
+def simple_kmeans(data: np.ndarray, k: int, max_iters: int = 100, seed: int = 42) -> np.ndarray:
     """
     Simple K-means clustering implementation.
-    
+
     Args:
         data: 1D array of values to cluster
         k: Number of clusters
         max_iters: Maximum number of iterations
-    
+        seed: Random seed for reproducibility
+
     Returns:
         cluster_labels: Array of cluster assignments (0 to k-1)
     """
+    rng = np.random.RandomState(seed)
     # Initialize centroids using k-means++
     centroids = []
-    centroids.append(data[np.random.randint(len(data))])
+    centroids.append(data[rng.randint(len(data))])
     
     for _ in range(1, k):
         # Calculate distances to nearest centroid
@@ -206,7 +212,7 @@ def simple_kmeans(data: np.ndarray, k: int, max_iters: int = 100) -> np.ndarray:
         probs = probs.astype(np.float64)
         probs /= probs.sum()
         # Select next centroid
-        centroids.append(data[np.random.choice(len(data), p=probs)])
+        centroids.append(data[rng.choice(len(data), p=probs)])
     
     centroids = np.array(centroids)
     
@@ -328,25 +334,35 @@ def analyze_single_prefill_bucketed(
         raise ValueError("No prefill records found!")
     
     # Combine all prefill records
-    combined_prefill = torch.cat(prefill_records, dim=1)  # Shape: [num_layers, total_prefill_tokens, topk]
-    
+    combined_prefill = torch.cat(prefill_records, dim=1)  # Shape: [num_layers, total_prefill_tokens, topk_buf]
+
     num_layers = combined_prefill.shape[0]
     num_tokens_prefill = combined_prefill.shape[1]
-    topk = combined_prefill.shape[2]
-    
+    topk_buf = combined_prefill.shape[2]
+
+    # Detect actual topk by checking for -1 padding in buffer
+    # (buffer may be larger than actual topk, padded with -1)
+    sample = combined_prefill[0, 0]  # first token of first layer
+    valid_mask = sample != -1
+    topk = int(valid_mask.sum().item())
+    if topk < topk_buf:
+        print(f"  Detected padding: buffer width={topk_buf}, actual TopK={topk}")
+        combined_prefill = combined_prefill[:, :, :topk]
+
     print(f"Combined prefill shape: {combined_prefill.shape}")
     print(f"  Layers: {num_layers}, Prefill tokens: {num_tokens_prefill}, TopK: {topk}")
-    
+
     # Process each layer
     all_results = []
     expected_total_activations = num_tokens_prefill * topk
     validation_errors = 0
-    
+
     for layer_idx in range(num_layers):
         layer_experts = combined_prefill[layer_idx]  # Shape: [num_tokens_prefill, topk]
-        
-        # Flatten and count expert activations
-        expert_counts = Counter(layer_experts.flatten().tolist())
+
+        # Flatten and count expert activations (exclude any remaining -1 padding)
+        flat = layer_experts.flatten().tolist()
+        expert_counts = Counter(x for x in flat if x != -1)
         
         # Get all expert IDs and their activation counts
         expert_ids = np.array(sorted(expert_counts.keys()))
@@ -408,41 +424,55 @@ def analyze_single_prefill_bucketed(
             best_labels = np.zeros(len(expert_ids), dtype=int)
             best_method = "single_bucket"
         
-        # Group experts by bucket
-        bucketed_expert_count = 0
-        bucketed_activation_total = 0
-        
+        # Group experts by bucket, then enforce conservation law:
+        # Σ(Avg_Activations × Num_Experts) == num_tokens_prefill × topk
+        target = expected_total_activations
+        bucket_list = []
+
         for bucket_id in range(num_buckets):
             bucket_mask = (best_labels == bucket_id)
             if not bucket_mask.any():
                 continue
-            
-            bucket_experts = expert_ids[bucket_mask]
-            bucket_activations = activation_counts[bucket_mask]
-            
-            bucketed_expert_count += len(bucket_experts)
-            bucketed_activation_total += int(bucket_activations.sum())
-            
-            avg_activations = bucket_activations.mean()
-            expert_ids_str = ','.join(map(str, sorted(bucket_experts)))
-            
+            n = int(bucket_mask.sum())
+            avg = round(float(activation_counts[bucket_mask].mean()))
+            bucket_list.append({'bucket_id': bucket_id, 'num_experts': n, 'avg': avg})
+
+        # Snap conservation: adjust largest bucket to absorb rounding error
+        actual = sum(b['avg'] * b['num_experts'] for b in bucket_list)
+        delta = target - actual
+        if delta != 0:
+            largest = max(bucket_list, key=lambda b: b['num_experts'])
+            largest['avg'] += delta // largest['num_experts']
+            # Any sub-expert residual: split into a second row
+            residual = target - sum(b['avg'] * b['num_experts'] for b in bucket_list)
+            if residual != 0:
+                sign = 1 if residual > 0 else -1
+                largest['num_experts'] -= abs(residual)
+                bucket_list.append({
+                    'bucket_id': largest['bucket_id'],
+                    'num_experts': abs(residual),
+                    'avg': largest['avg'] + sign,
+                })
+
+        for b in bucket_list:
             all_results.append({
                 'Layer': layer_idx,
-                'Bucket': bucket_id,
-                'Expert_IDs': expert_ids_str,
-                'Avg_Activations': round(avg_activations),
+                'Bucket': b['bucket_id'],
+                'Num_Experts': b['num_experts'],
+                'Avg_Activations': b['avg'],
                 'Batch_Size': batch_size,
                 'TopK': topk,
                 'Dtype': dtype,
                 'Quantization': quantization if quantization else ''
             })
-        
-        # Validate: bucketing must not lose experts or activations
-        if bucketed_expert_count != len(expert_ids):
-            print(f"  WARNING Layer {layer_idx}: bucketed {bucketed_expert_count} experts != {len(expert_ids)} total")
+
+        # Validate
+        csv_total = sum(b['avg'] * b['num_experts'] for b in bucket_list)
+        if csv_total != target:
+            print(f"  WARNING Layer {layer_idx}: conservation failed {csv_total} != {target}")
             validation_errors += 1
-        if bucketed_activation_total != actual_total:
-            print(f"  WARNING Layer {layer_idx}: bucketed activations {bucketed_activation_total} != {actual_total} total")
+        if csv_total != expected_total_activations:
+            print(f"  WARNING Layer {layer_idx}: conservation failed {csv_total} != {expected_total_activations}")
             validation_errors += 1
     
     if validation_errors == 0:
@@ -553,7 +583,7 @@ def main():
     print(f"✓ Saved prefill distribution to: {output_file}")
     print(f"  Total rows: {len(combined_df)}")
     print(f"  Batch sizes: {sorted(combined_df['Batch_Size'].unique())}")
-    print(f"  Format: Layer, Bucket, Expert_IDs, Avg_Activations, Batch_Size, TopK, Dtype, Quantization")
+    print(f"  Format: Layer, Bucket, Num_Experts, Avg_Activations, Batch_Size, TopK, Dtype, Quantization")
     print(f"{'='*80}")
 
 

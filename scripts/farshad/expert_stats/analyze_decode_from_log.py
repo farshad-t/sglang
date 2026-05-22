@@ -48,10 +48,14 @@ def parse_log_file(log_file_path):
                 # PT path is relative to parent of log file  
                 pt_path = (log_file_path.parent / pt_path_str).resolve()
         
+        # If path doesn't exist, try remapping /code/ docker path to host path
+        if not pt_path.exists() and '/code/' in pt_path_str:
+            host_base = Path('/data/farshad/github/vllm-llama-endpoints/closed/Intel/code/endpoints')
+            pt_path = (host_base / pt_path_str.replace('/code/', '', 1)).resolve()
         info['pt_file_path'] = pt_path
     else:
         raise ValueError(f"Could not find .pt file path in log: {log_file_path}")
-    
+
     # Extract dtype and quantization
     dtype_match = re.search(r"dtype='([^']*)'", content)
     if dtype_match:
@@ -309,7 +313,15 @@ def analyze_decode_histogram(log_file_path, return_dataframe=False):
     
     # Analyze decode phase
     all_topk_ids = decode_data
-    num_layers, num_tokens, topk = all_topk_ids.shape
+    num_layers, num_tokens, topk_buf = all_topk_ids.shape
+
+    # Detect actual topk by checking for -1 padding
+    sample = all_topk_ids[0, 0]
+    valid_mask = sample != -1
+    topk = int(valid_mask.sum().item())
+    if topk < topk_buf:
+        print(f"  Detected padding: buffer width={topk_buf}, actual TopK={topk}")
+        all_topk_ids = all_topk_ids[:, :, :topk]
     
     print(f"\nModel Configuration:")
     print(f"  Number of layers: {num_layers}")
