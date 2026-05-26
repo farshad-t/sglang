@@ -463,8 +463,18 @@ def analyze_single_prefill_bucketed(
                         break
 
         csv_total = sum(b['avg'] * b['num_experts'] for b in bucket_list)
+        # Round Σ up to ceil(csv_total / K) * K so downstream reshape [-1, K, D] works.
+        # Split 1 expert off a bucket and add the pad to that single expert.
+        remainder = csv_total % topk
+        if remainder != 0:
+            pad = topk - remainder
+            donor = max(bucket_list, key=lambda b: b['num_experts'])
+            donor['num_experts'] -= 1
+            bucket_list.append({'bucket_id': donor['bucket_id'], 'num_experts': 1, 'avg': donor['avg'] + pad})
+            csv_total += pad
         overshoot = csv_total - target
         assert csv_total >= target, f"Layer {layer_idx}: conservation violated {csv_total} < {target}"
+        assert csv_total % topk == 0, f"Layer {layer_idx}: Σ(N×A)={csv_total} not divisible by K={topk}"
 
         for b in bucket_list:
             all_results.append({

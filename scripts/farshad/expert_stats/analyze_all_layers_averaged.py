@@ -407,8 +407,24 @@ def analyze_all_layers_prefill(records, info, num_buckets=5):
                     break
 
     csv_total = sum(r['avg_activations'] * r['num_experts'] for r in bucket_rows)
+    # Round Σ up to ceil(csv_total / K) * K so downstream reshape [-1, K, D] works.
+    # Split 1 expert off a bucket and add the pad to that single expert.
+    remainder = csv_total % topk
+    if remainder != 0:
+        pad = topk - remainder
+        donor = max(bucket_rows, key=lambda b: b['num_experts'])
+        donor['num_experts'] -= 1
+        bucket_rows.append({
+            'bucket_id': donor['bucket_id'],
+            'num_experts': 1,
+            'avg_activations': donor['avg_activations'] + pad,
+            'min_activations': donor['min_activations'],
+            'max_activations': donor['max_activations'],
+        })
+        csv_total += pad
     overshoot = csv_total - target
     assert csv_total >= target, f"Prefill all-layers: conservation violated {csv_total} < {target}"
+    assert csv_total % topk == 0, f"Prefill all-layers: Σ(N×A)={csv_total} not divisible by K={topk}"
 
     rows = []
     for r in bucket_rows:
