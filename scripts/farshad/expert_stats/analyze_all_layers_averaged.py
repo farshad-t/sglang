@@ -387,18 +387,28 @@ def analyze_all_layers_prefill(records, info, num_buckets=5):
             'max_activations': round(bucket_activations.max()),
         })
 
-    # Enforce conservation: Σ(Avg_Activations × Num_Experts) == target
+    # Enforce conservation: Σ(Avg_Activations × Num_Experts) >= target,
+    # with minimum overshoot. Model is always at least as expensive as reality.
     target = num_tokens_prefill * topk
     actual = sum(r['avg_activations'] * r['num_experts'] for r in bucket_rows)
-    delta = target - actual
+    delta = target - actual  # positive = under-count
 
-    if delta != 0:
-        largest_idx = max(range(len(bucket_rows)), key=lambda i: bucket_rows[i]['num_experts'])
-        largest = bucket_rows[largest_idx]
-        n = largest['num_experts']
-        largest['avg_activations'] += delta // n
+    if delta > 0:
+        best_bucket = min(bucket_rows,
+                         key=lambda b: (b['num_experts'] - delta % b['num_experts']) % b['num_experts'])
+        n = best_bucket['num_experts']
+        best_bucket['avg_activations'] += (delta + n - 1) // n
+    elif delta < 0:
+        for r in sorted(bucket_rows, key=lambda b: b['num_experts']):
+            if actual - r['num_experts'] >= target:
+                r['avg_activations'] -= 1
+                actual -= r['num_experts']
+                if actual <= target + r['num_experts']:
+                    break
 
     csv_total = sum(r['avg_activations'] * r['num_experts'] for r in bucket_rows)
+    overshoot = csv_total - target
+    assert csv_total >= target, f"Prefill all-layers: conservation violated {csv_total} < {target}"
 
     rows = []
     for r in bucket_rows:
@@ -416,12 +426,8 @@ def analyze_all_layers_prefill(records, info, num_buckets=5):
             'Quantization': info.get('quantization') if info.get('quantization') else ''
         })
 
-    largest_n = max(r['num_experts'] for r in bucket_rows)
-    residual = abs(csv_total - target)
-    status = 'PASS' if residual < largest_n else 'FAIL'
     print(f"  Prefill all-layers: {len(rows)} buckets, CV={best_cv:.4f}, "
-          f"conservation={status} "
-          f"({csv_total}/{target}, residual={residual})")
+          f"Σ(N×A)={csv_total} >= target={target}, overshoot={overshoot}")
     return pd.DataFrame(rows)
 
 

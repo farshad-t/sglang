@@ -437,12 +437,34 @@ def analyze_single_prefill_bucketed(
             avg = round(float(activation_counts[bucket_mask].mean()))
             bucket_list.append({'bucket_id': bucket_id, 'num_experts': n, 'avg': avg})
 
-        # Snap conservation: adjust largest bucket to absorb rounding error
+        # Enforce conservation: Σ(Avg × N) >= target, with minimum overshoot.
+        # We guarantee the model is at least as expensive as reality.
         actual = sum(b['avg'] * b['num_experts'] for b in bucket_list)
-        delta = target - actual
-        if delta != 0:
-            largest = max(bucket_list, key=lambda b: b['num_experts'])
-            largest['avg'] += delta // largest['num_experts']
+        delta = target - actual  # positive = under-count, negative = over-count
+
+        if delta > 0:
+            # Under-count: add tokens. Pick bucket where +1 to avg
+            # causes the smallest overshoot (i.e., bucket with largest N
+            # that doesn't overshoot by more than N, or smallest N that
+            # brings us to or above target with minimum excess).
+            best_bucket = min(bucket_list,
+                             key=lambda b: (b['num_experts'] - delta % b['num_experts']) % b['num_experts'])
+            n = best_bucket['num_experts']
+            best_bucket['avg'] += (delta + n - 1) // n  # ceiling division
+        elif delta < 0:
+            # Over-count: we're already >= target, leave as-is (model is
+            # more expensive). But if overshoot is large, try to reduce it.
+            # Find bucket where -1 to avg still keeps us >= target.
+            for b in sorted(bucket_list, key=lambda b: b['num_experts']):
+                if actual - b['num_experts'] >= target:
+                    b['avg'] -= 1
+                    actual -= b['num_experts']
+                    if actual <= target + b['num_experts']:
+                        break
+
+        csv_total = sum(b['avg'] * b['num_experts'] for b in bucket_list)
+        overshoot = csv_total - target
+        assert csv_total >= target, f"Layer {layer_idx}: conservation violated {csv_total} < {target}"
 
         for b in bucket_list:
             all_results.append({
@@ -456,18 +478,14 @@ def analyze_single_prefill_bucketed(
                 'Quantization': quantization if quantization else ''
             })
 
-        # Validate (allow residual up to largest_bucket_size - 1)
-        csv_total = sum(b['avg'] * b['num_experts'] for b in bucket_list)
-        largest_n = max(b['num_experts'] for b in bucket_list)
-        residual = abs(csv_total - target)
-        if residual >= largest_n:
-            print(f"  WARNING Layer {layer_idx}: conservation error too large {csv_total} vs {target} (residual={residual})")
+        if overshoot > max(b['num_experts'] for b in bucket_list):
+            print(f"  WARNING Layer {layer_idx}: overshoot={overshoot} (target={target}, actual={csv_total})")
             validation_errors += 1
 
     if validation_errors == 0:
-        print(f"\n  VALIDATION PASSED: all {num_layers} layers within tolerance")
+        print(f"\n  VALIDATION PASSED: all {num_layers} layers satisfy Σ(N×A) >= target")
     else:
-        print(f"\n  VALIDATION FAILED: {validation_errors} error(s) detected — discarding results")
+        print(f"\n  VALIDATION FAILED: {validation_errors} layer(s) with excessive overshoot")
         return pd.DataFrame()
     
     df = pd.DataFrame(all_results)
