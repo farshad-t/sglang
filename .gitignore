@@ -277,3 +277,6 @@ sgl-kernel/csrc/**/*_musa/
 *.npz
 artifacts/
 .claude/scheduled_tasks.lock
+
+# Expert stats data (logs, .pt files, CSVs) — large, local only
+scripts/farshad/expert_stats/data/
