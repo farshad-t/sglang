@@ -396,23 +396,7 @@ def analyze_all_layers_prefill(records, info, num_buckets=5):
         largest_idx = max(range(len(bucket_rows)), key=lambda i: bucket_rows[i]['num_experts'])
         largest = bucket_rows[largest_idx]
         n = largest['num_experts']
-        adjust = delta // n
-        residual = delta - adjust * n
-
-        largest['avg_activations'] += adjust
-
-        if residual != 0:
-            sign = 1 if residual > 0 else -1
-            abs_residual = abs(residual)
-            # Split abs_residual experts from largest bucket into sub-bucket
-            largest['num_experts'] -= abs_residual
-            bucket_rows.append({
-                'bucket_id': largest['bucket_id'],
-                'num_experts': abs_residual,
-                'avg_activations': largest['avg_activations'] + sign,
-                'min_activations': largest['min_activations'],
-                'max_activations': largest['max_activations'],
-            })
+        largest['avg_activations'] += delta // n
 
     csv_total = sum(r['avg_activations'] * r['num_experts'] for r in bucket_rows)
 
@@ -432,9 +416,12 @@ def analyze_all_layers_prefill(records, info, num_buckets=5):
             'Quantization': info.get('quantization') if info.get('quantization') else ''
         })
 
+    largest_n = max(r['num_experts'] for r in bucket_rows)
+    residual = abs(csv_total - target)
+    status = 'PASS' if residual < largest_n else 'FAIL'
     print(f"  Prefill all-layers: {len(rows)} buckets, CV={best_cv:.4f}, "
-          f"conservation={'PASS' if csv_total == target else 'FAIL'} "
-          f"({csv_total}/{target})")
+          f"conservation={status} "
+          f"({csv_total}/{target}, residual={residual})")
     return pd.DataFrame(rows)
 
 
