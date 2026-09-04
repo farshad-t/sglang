@@ -371,6 +371,21 @@ def main() -> int:
     p.add_argument("--moe-intermediate-size", type=int,
                    default=DEFAULT_MODEL["moe_intermediate_size"])
     p.add_argument("--topk", type=int, default=DEFAULT_MODEL["topk"])
+    p.add_argument("--tp", type=int, default=1,
+                   help="tensor-parallel size to shard moe_intermediate_size by, i.e. what "
+                        "ONE rank executes (N -> N/tp, all E experts kept). The expert "
+                        "stats are still looked up under the unsharded model key, since "
+                        "routing does not depend on the split. Note archbench's own "
+                        "Qwen3_5MoeExperts does NOT shard the MoE, so --tp 1 is what the "
+                        "projection charges per rank and --tp 4 is what a real sglang TP4 "
+                        "rank runs.")
+    p.add_argument("--dense-ffn", action="store_true",
+                   help="benchmark a DENSE SwiGLU FFN instead of an MoE layer, as the "
+                        "num_experts=1 case (which is how archbench models it). Reads no "
+                        "stats; use for the dense models in the daily run, e.g. 9B: "
+                        "--dense-ffn --hidden-size 4096 --intermediate-size 12288")
+    p.add_argument("--intermediate-size", type=int, default=12288,
+                   help="dense FFN intermediate size; only used with --dense-ffn")
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--iters", type=int, default=10)
     p.add_argument("--threads", type=int, default=None, help="torch.set_num_threads")
@@ -400,12 +415,30 @@ def main() -> int:
     if args.layer == ["all"]:
         args.layer = list(range(args.num_layers))
 
+    if args.dense_ffn:
+        # A dense SwiGLU FFN is the num_experts=1 case -- archbench says so itself
+        # (common/swiglu_block.py: "num_experts=1 is the dense FFN case"), and it is the
+        # same BatchedSwiGLU primitive the MoE expert groups are built from. So route it
+        # through the identical path with a synthetic one-expert, topk=1 histogram
+        # instead of bolting on a second kernel. Needed for the dense models in the
+        # daily run (9B), which have no expert stats because they have no experts.
+        args.num_experts, args.topk = 1, 1
+        args.moe_intermediate_size = args.intermediate_size
+        args.expert_stats_mode = "dense_ffn"
+        args.layer = [0]  # every dense layer is the same shape; nothing to sweep
+
+    # The stats key is always the UNSHARDED model: routing is a property of the model,
+    # not of how its experts are split across ranks. Only the kernel shapes shrink.
+    model_key = f"{args.hidden_size}-{args.num_experts}-{args.moe_intermediate_size}"
+    if args.moe_intermediate_size % args.tp:
+        p.error(f"--tp {args.tp} does not divide moe_intermediate_size "
+                f"{args.moe_intermediate_size}")
+
     model = dict(hidden_size=args.hidden_size, num_experts=args.num_experts,
-                 moe_intermediate_size=args.moe_intermediate_size, topk=args.topk)
+                 moe_intermediate_size=args.moe_intermediate_size // args.tp,
+                 topk=args.topk)
     K, N, E, topk = (model["hidden_size"], model["moe_intermediate_size"],
                      model["num_experts"], model["topk"])
-
-    model_key = f"{K}-{E}-{N}"
 
     if args.ab_prefetch:
         src = archbench_stats.from_args(args)
@@ -417,7 +450,10 @@ def main() -> int:
         print(f"cached {n} files under {src.files_dir}")
         return 0
 
-    csv_file, provenance, stats_commit = resolve_csv(args, args.phase, model_key)
+    if args.dense_ffn:
+        csv_file, provenance, stats_commit = "", "dense FFN (synthetic, no stats)", ""
+    else:
+        csv_file, provenance, stats_commit = resolve_csv(args, args.phase, model_key)
 
     caller = None
     if not args.dry_run:
@@ -444,8 +480,14 @@ def main() -> int:
     for batch in args.batch:
         for layer in args.layer:
             tag = f"{args.phase} bs{batch} L{layer}"
-            hist = moe_stats.read_histogram(csv_file, args.phase, batch, layer,
-                                            args.expert_stats_mode)
+            if args.dense_ffn:
+                # One "expert" seeing every token: decode routes 1 token/seq, prefill seq_len.
+                tokens = batch * (args.seq_len if args.phase == "prefill" else 1)
+                tag = f"{args.phase} bs{batch} dense"
+                hist = {tokens: 1}
+            else:
+                hist = moe_stats.read_histogram(csv_file, args.phase, batch, layer,
+                                                args.expert_stats_mode)
             if hist is None:
                 print(f"\n{tag}: no stats rows -- skipped")
                 continue
@@ -481,6 +523,7 @@ def main() -> int:
                        dtype=args.dtype,
                        stats_mode=args.expert_stats_mode, hidden_size=K,
                        moe_intermediate_size=N, num_experts=E, topk=topk,
+                       tp=args.tp, threads=args.threads or 0,
                        num_groups=len(groups), active_experts=active,
                        histogram_mass=mass, routed_tokens=R, slack=slack,
                        num_tokens=num_tokens, gflop=flops / 1e9,
