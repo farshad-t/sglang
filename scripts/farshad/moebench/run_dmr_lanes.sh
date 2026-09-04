@@ -2,150 +2,237 @@
 # Run the bf16 lanes of the qwen35 DMR-X4 daily run through the MoE/FFN kernel
 # benchmark, so each lane's projected layer cost has a measured counterpart.
 #
-# Lanes taken from tools/cpu/config/qwen35/qwen35_dmrx4_lanes_20260903_1119_collmodes_shmprofile.csv
-# (all four share input_seq_len=1024, output_seq_len=1024, gen_start=gen_end=1536,
+# Lanes from tools/cpu/config/qwen35/qwen35_dmrx4_lanes_20260903_1119_collmodes_shmprofile.csv
+# (all share input_seq_len=1024, output_seq_len=1024, gen_start=gen_end=1536,
 # hw dmr_ap_x4_16ch_224c_128cbo_ddr8000):
 #
-#   lane 1/2   qwen35_009b_bs001_TP4_bf16          rt   bs1    TP4  numUnits [56]
 #   lane 3/4   qwen35_035b_bs001_TP4_bf16_a003b    rt   bs1    TP4  numUnits [56]
-#   lane 7/8   qwen35_009b_bs096_TP1_bf16          thr  bs96   TP1  (whole socket)
 #   lane 9/10  qwen35_035b_bs320_TP1_bf16_a003b    thr  bs320  TP1  (whole socket)
+#   lane 1/2   qwen35_009b_bs001_TP4_bf16          rt   bs1    TP4  (DENSE model)
+#   lane 7/8   qwen35_009b_bs096_TP1_bf16          thr  bs96   TP1  (DENSE model)
 #
-# The 9B is DENSE (Qwen3_5ForConditionalGeneration, hidden 4096 / intermediate 12288,
-# no num_experts), so its lanes run --dense-ffn, i.e. the num_experts=1 case that
-# archbench itself uses for a dense FFN. Only the 35B has routed experts.
+# ============================ WHY 4 CONCURRENT INSTANCES =======================
+# A 56-core run with the other 168 cores IDLE is optimistic: that slice gets memory
+# bandwidth, LLC and power headroom that do not exist when the socket is actually
+# serving. So every rt cell runs as FOUR concurrent instances pinned to 0-55,
+# 56-111, 112-167, 168-223, started together and joined with a `wait` barrier, all
+# doing the SAME shape -- which is also physically what TP4 is: four ranks running
+# the same layer at the same time. Per-instance times are reported separately; the
+# slowest instance is what a rank actually waits for.
 #
-# TP: the projection DOES shard the MoE intermediate dim. `Qwen3_5MoeExperts` passes
-# `config.moe_intermediate_size` through undivided, but the division happens one level
-# down in `BatchedSwiGLU.forward` (common/experts.py:50):
+# The thr lanes are TP1 over the whole socket, so a single 224-core instance already
+# leaves nothing idle and the same concern does not apply. SPREAD_THR=4 runs them
+# 4-way anyway (i.e. four independent model instances) if you want that contrast.
+#
+# SNC is OFF on this box (1 NUMA node, cores 0-223), and numactl is not installed,
+# so pinning is taskset + OMP_PLACES/OMP_PROC_BIND. There is no per-node membind to
+# do, and memory is not channel-partitioned by SNC node anyway.
+#
+# ============================ TP SHARDING ======================================
+# The projection DOES shard the MoE intermediate dim. Qwen3_5MoeExperts passes
+# config.moe_intermediate_size through undivided, but the division happens one level
+# down in BatchedSwiGLU.forward (common/experts.py:50):
 #     local_hidden_dim = math.ceil(self.hidden_dim / self.args.model_parallel_size)
 # where `hidden_dim` IS the moe intermediate size. Dense FFNs shard the same way in
-# `FeedForward.forward` (Llama4/ffn.py:45). Each rank keeps all E experts and holds
-# N/TP of the intermediate, i.e. row-parallel down_proj, and the MoE block owns ONE
-# all-reduce on the routed+shared expert sum (each expert passes collective_tp_size=1
-# precisely so the AR is not charged per expert).
+# FeedForward.forward (Llama4/ffn.py:45). Each rank keeps all E experts and holds
+# N/TP of the intermediate (row-parallel down_proj), and the MoE block owns ONE
+# all-reduce over the routed+shared expert sum -- each expert is built with
+# collective_tp_size=1 precisely so that AR is not charged per expert.
+# So the TP4 rt lanes use --tp 4 (N = 512/4 = 128). The `_unsharded` lane is a --tp 1
+# contrast that isolates what the split costs the kernel, not the reference.
 #
-# So for the TP4 rt lanes the faithful shape is --tp 4 (N = 512/4 = 128). The
-# `_unsharded` lanes below are a --tp 1 contrast, not the reference.
+# ============================ POWER / STATE ====================================
+# The governor is read and recorded before and after, and the run REFUSES to start if
+# it is not `performance` or if the box is busy. It is deliberately never CHANGED:
+# this is a SHARED box (other user `sdp`), the governor is system-wide, and setting it
+# needs sudo. If it ever reads back as not-performance, ask the owner rather than
+# forcing it. FORCE=1 skips both guards.
 #
 # Knobs (env):
-#   OUT=<dir>        output dir                    (default results_<timestamp>)
-#   THREADS_RT=56    threads for the rt lanes = one TP rank's core budget
-#   THREADS_THR=224  threads for the thr lanes = whole socket
-#   LAYERS=all       --layer value for the 35B lanes (e.g. 0,10,20,30,39 to sample)
-#   AB="..."         extra stats-source flags, e.g. AB="--ab-offline"
-#   PY=python3       interpreter
-#   LANES="..."      subset of: 35b_rt 35b_rt_unsharded 35b_thr 35b_shared_rt
-#                    35b_shared_thr 9b_rt 9b_thr
+#   OUT=<dir>            output dir                  (default results_<timestamp>)
+#   CORES=56             cores per instance
+#   SPREAD_RT=4          concurrent instances for rt lanes
+#   SPREAD_THR=1         concurrent instances for thr lanes
+#   THREADS_THR=224      threads for a single-instance thr run
+#   LAYERS=all           --layer for the 35B lanes (e.g. 0,10,20,30,39 to sample)
+#   MAXLOAD=2.0          refuse to start above this 1-min load average
+#   AB="..."             extra stats-source flags, e.g. AB="--ab-offline"
+#   PY=python3           interpreter
+#   FORCE=1              skip the busy/governor guards
+#   LANES="..."          subset of: 35b_rt 35b_rt_unsharded 35b_thr 35b_thr_spread
+#                        35b_shared_rt 35b_shared_thr 9b_rt 9b_thr
 set -euo pipefail
 cd "$(dirname "$0")"
 
 OUT=${OUT:-results_$(date +%Y%m%d_%H%M%S)}
-THREADS_RT=${THREADS_RT:-56}
+CORES=${CORES:-56}
+SPREAD_RT=${SPREAD_RT:-4}
+SPREAD_THR=${SPREAD_THR:-1}
 THREADS_THR=${THREADS_THR:-224}
 LAYERS=${LAYERS:-all}
+MAXLOAD=${MAXLOAD:-2.0}
 AB=${AB:-}
 PY=${PY:-python3}
+FORCE=${FORCE:-0}
 LANES=${LANES:-"35b_rt 35b_rt_unsharded 35b_thr 35b_shared_rt 35b_shared_thr"}
 
 mkdir -p "$OUT"
-echo "output dir: $OUT"
-{
-  echo "host       : $(hostname)"
-  echo "date       : $(date -Is)"
-  echo "nproc      : $(nproc)"
-  echo "numactl    :"; numactl --hardware 2>&1 | sed 's/^/  /' || echo "  (numactl absent)"
-  echo "cpu        :"; lscpu 2>/dev/null | grep -E '^(Model name|Socket|Core|Thread|NUMA node\(s\)|CPU max)' | sed 's/^/  /'
-  echo "threads_rt : $THREADS_RT"
-  echo "threads_thr: $THREADS_THR"
-  echo "layers     : $LAYERS"
-  echo "git        : $(git rev-parse HEAD 2>/dev/null || echo n/a)"
-} | tee "$OUT/env.txt"
 
-run() {   # run <name> <log-suffix> <args...>
-  local name=$1; shift
+gov() { cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo unknown; }
+epp() { cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference 2>/dev/null || echo unknown; }
+
+GOV_BEFORE=$(gov)
+{
+  echo "host        : $(hostname)"
+  echo "date        : $(date -Is)"
+  echo "nproc       : $(nproc)"
+  echo "uptime      : $(uptime)"
+  echo "governor    : $GOV_BEFORE   (epp $(epp))"
+  echo "no_turbo    : $(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || echo n/a)"
+  echo "tuned       : $(tuned-adm active 2>/dev/null | head -1 || echo n/a)"
+  echo "numa        :"; (numactl --hardware 2>/dev/null || echo "  numactl absent; NUMA node(s) = $(lscpu | awk -F: '/NUMA node\(s\)/{print $2}' | tr -d ' ')") | sed 's/^/  /'
+  echo "cpu         :"; lscpu 2>/dev/null | grep -E '^(Model name|Socket|Core|Thread|NUMA node\(s\)|CPU max)' | sed 's/^/  /'
+  echo "bios        : $(cat /sys/class/dmi/id/bios_version 2>/dev/null || echo n/a)"
+  echo "cores/inst  : $CORES"
+  echo "spread rt   : $SPREAD_RT   thr: $SPREAD_THR"
+  echo "layers      : $LAYERS"
+  echo "git         : $(git rev-parse HEAD 2>/dev/null || echo n/a)"
+  echo "torch       : $($PY -c 'import torch;print(torch.__version__)' 2>/dev/null || echo n/a)"
+} | tee "$OUT/env_before.txt"
+
+# ---- guards -------------------------------------------------------------------
+if [ "$FORCE" != "1" ]; then
+  L1=$(awk '{print $1}' /proc/loadavg)
+  if awk -v l="$L1" -v m="$MAXLOAD" 'BEGIN{exit !(l>m)}'; then
+    echo "REFUSING: 1-min load average $L1 > MAXLOAD $m -- the box is busy, and a" >&2
+    echo "          contended measurement is worse than no measurement. Wait, or FORCE=1." >&2
+    exit 1
+  fi
+  if [ "$GOV_BEFORE" != "performance" ]; then
+    echo "REFUSING: governor is '$GOV_BEFORE', not 'performance'." >&2
+    echo "          This is a SHARED box and the governor is system-wide, so this script" >&2
+    echo "          will not change it. Ask the owner to set it, or FORCE=1 to measure" >&2
+    echo "          anyway (and say so in the writeup)." >&2
+    exit 1
+  fi
+  echo "guards ok: load $L1 <= $MAXLOAD, governor $GOV_BEFORE"
+fi
+
+# ---- one cell, N concurrent pinned instances ----------------------------------
+# Every instance runs the SAME shape at the SAME time so the socket is fully loaded,
+# then we join on all of them.
+spread() {  # spread <name> <n_instances> <threads_per_instance> <args...>
+  local name=$1 n=$2 thr=$3; shift 3
   echo
-  echo "################ $name"
-  # shellcheck disable=SC2086
-  $PY bench_moe_cpu.py "$@" $AB --out "$OUT/results.csv" 2>&1 | tee "$OUT/$name.log"
+  echo "################ $name   (${n} x ${thr}t concurrent)"
+  local pids=() i lo hi
+  for ((i = 0; i < n; i++)); do
+    if [ "$n" -eq 1 ] && [ "$thr" -ge "$(nproc)" ]; then
+      lo=0; hi=$(( $(nproc) - 1 ))
+    else
+      lo=$(( i * CORES )); hi=$(( lo + CORES - 1 ))
+    fi
+    # shellcheck disable=SC2086
+    taskset -c "$lo-$hi" env \
+        OMP_NUM_THREADS="$thr" OMP_PROC_BIND=close OMP_PLACES=cores \
+        KMP_AFFINITY=granularity=fine,compact,1,0 \
+      $PY bench_moe_cpu.py "$@" --threads "$thr" $AB \
+        --out "$OUT/results.inst$i.csv" > "$OUT/$name.inst$i.log" 2>&1 &
+    pids+=($!)
+  done
+  local rc=0
+  for p in "${pids[@]}"; do wait "$p" || rc=1; done
+  for ((i = 0; i < n; i++)); do
+    printf '  inst%d [%s] ' "$i" "$( [ "$n" -eq 1 ] && echo "0-$(( $(nproc) - 1 ))" || echo "$(( i * CORES ))-$(( i * CORES + CORES - 1 ))" )"
+    grep -hE 'fused_experts_cpu:|batched GEMMs:|check:' "$OUT/$name.inst$i.log" | tr '\n' '|' | sed 's/  */ /g'
+    echo
+  done
+  if [ "$rc" != 0 ]; then
+    echo "  !! at least one instance failed -- see $OUT/$name.inst*.log" >&2
+    tail -5 "$OUT/$name.inst0.log" >&2
+  fi
+  return 0
 }
 
 has() { [[ " $LANES " == *" $1 "* ]]; }
 
-# ---- 35B-A3B bf16, realtime: bs1, ONE TP4 rank (56 cores, N = 512/4 = 128) -----
-# THE reference lane: matches what the projection charges a rank and what a real
-# sglang TP4 rank executes.
+# ---- 35B-A3B bf16 realtime: bs1, 4 concurrent TP4 ranks, N = 512/4 = 128 -------
 if has 35b_rt; then
-  run 35b_rt_decode  --phase decode  --batch 1 --layer "$LAYERS" --mode both --check \
-      --tp 4 --threads "$THREADS_RT" --iters 20 --warmup 5
-  run 35b_rt_prefill --phase prefill --batch 1 --layer "$LAYERS" --mode both \
-      --tp 4 --threads "$THREADS_RT" --iters 10 --warmup 3
+  spread 35b_rt_decode  "$SPREAD_RT" "$CORES" --phase decode  --batch 1 --layer "$LAYERS" \
+      --mode both --check --tp 4 --iters 20 --warmup 5
+  spread 35b_rt_prefill "$SPREAD_RT" "$CORES" --phase prefill --batch 1 --layer "$LAYERS" \
+      --mode both --tp 4 --iters 10 --warmup 3
 fi
 
-# ---- same lane UNSHARDED (--tp 1, N=512) -- contrast only, not the reference ----
-# Isolates what the TP split costs the kernel: same routing, 4x the N.
+# ---- same, UNSHARDED (--tp 1, N=512): contrast only, not the reference ---------
 if has 35b_rt_unsharded; then
-  run 35b_rt_unsharded_decode  --phase decode  --batch 1 --layer "$LAYERS" --mode both \
-      --threads "$THREADS_RT" --iters 20 --warmup 5
-  run 35b_rt_unsharded_prefill --phase prefill --batch 1 --layer "$LAYERS" --mode both \
-      --threads "$THREADS_RT" --iters 10 --warmup 3
+  spread 35b_rt_unsharded_decode  "$SPREAD_RT" "$CORES" --phase decode  --batch 1 \
+      --layer "$LAYERS" --mode both --iters 20 --warmup 5
+  spread 35b_rt_unsharded_prefill "$SPREAD_RT" "$CORES" --phase prefill --batch 1 \
+      --layer "$LAYERS" --mode both --iters 10 --warmup 3
 fi
 
-# ---- 35B-A3B bf16, throughput: bs320, TP1, whole socket -----------------------
-# bs320 prefill is the heaviest cell by far (~19.7 TFLOP/layer, 392k tokens fed) and
-# is also the +19.7% mass-overshoot cell. Few iterations on purpose.
+# ---- 35B-A3B bf16 throughput: bs320, TP1, ONE instance over all 224 cores ------
+# One 224-core instance leaves no core idle, so it needs no spread. bs320 prefill is
+# the heaviest cell by far (~19.7 TFLOP/layer, 392k tokens fed) -- few iterations.
 if has 35b_thr; then
-  run 35b_thr_decode  --phase decode  --batch 320 --layer "$LAYERS" --mode both \
-      --threads "$THREADS_THR" --iters 10 --warmup 3
-  run 35b_thr_prefill --phase prefill --batch 320 --layer "$LAYERS" --mode fused \
-      --threads "$THREADS_THR" --iters 3 --warmup 1
+  spread 35b_thr_decode  "$SPREAD_THR" "$THREADS_THR" --phase decode  --batch 320 \
+      --layer "$LAYERS" --mode both --iters 10 --warmup 3
+  spread 35b_thr_prefill "$SPREAD_THR" "$THREADS_THR" --phase prefill --batch 320 \
+      --layer "$LAYERS" --mode fused --iters 3 --warmup 1
 fi
 
-# ---- 35B SHARED expert (dense, K=2048 N=512) ----------------------------------
-# The 35B MoE block is routed experts PLUS a shared expert every token passes through
-# (shared_expert_intermediate_size=512, a Qwen3_5MLP whose down_proj is row-parallel and
-# whose partial output is summed into the same single all-reduce). A layer-level compare
-# against the projection needs it, so measure it as its own dense cell.
-SHARED35B="--dense-ffn --hidden-size 2048 --intermediate-size 512"
+# ---- thr lane as 4 independent 56-core instances (contrast) --------------------
+if has 35b_thr_spread; then
+  spread 35b_thr_spread_decode 4 "$CORES" --phase decode --batch 320 --layer "$LAYERS" \
+      --mode both --iters 10 --warmup 3
+fi
+
+# ---- 35B SHARED expert (dense, K=2048, N=512) ---------------------------------
+# The MoE block is routed experts PLUS a shared expert every token passes through
+# (shared_expert_intermediate_size=512, a Qwen3_5MLP with row-parallel down_proj whose
+# partial output joins the same single all-reduce). A layer-level compare needs it.
+SHARED35B=(--dense-ffn --hidden-size 2048 --intermediate-size 512)
 if has 35b_shared_rt; then
-  # shellcheck disable=SC2086
-  run 35b_shared_rt_decode  $SHARED35B --phase decode  --batch 1 --mode both --check \
-      --tp 4 --threads "$THREADS_RT" --iters 20 --warmup 5
-  # shellcheck disable=SC2086
-  run 35b_shared_rt_prefill $SHARED35B --phase prefill --batch 1 --mode both \
-      --tp 4 --threads "$THREADS_RT" --iters 10 --warmup 3
+  spread 35b_shared_rt_decode  "$SPREAD_RT" "$CORES" "${SHARED35B[@]}" --phase decode \
+      --batch 1 --mode both --check --tp 4 --iters 20 --warmup 5
+  spread 35b_shared_rt_prefill "$SPREAD_RT" "$CORES" "${SHARED35B[@]}" --phase prefill \
+      --batch 1 --mode both --tp 4 --iters 10 --warmup 3
 fi
 if has 35b_shared_thr; then
-  # shellcheck disable=SC2086
-  run 35b_shared_thr_decode  $SHARED35B --phase decode  --batch 320 --mode both --check \
-      --threads "$THREADS_THR" --iters 20 --warmup 5
-  # shellcheck disable=SC2086
-  run 35b_shared_thr_prefill $SHARED35B --phase prefill --batch 320 --mode both \
-      --threads "$THREADS_THR" --iters 3 --warmup 1
+  spread 35b_shared_thr_decode  "$SPREAD_THR" "$THREADS_THR" "${SHARED35B[@]}" \
+      --phase decode --batch 320 --mode both --check --iters 20 --warmup 5
+  spread 35b_shared_thr_prefill "$SPREAD_THR" "$THREADS_THR" "${SHARED35B[@]}" \
+      --phase prefill --batch 320 --mode both --iters 3 --warmup 1
 fi
 
-# ---- 9B bf16: DENSE model, no MoE at all --------------------------------------
-# Qwen3_5ForConditionalGeneration, hidden 4096 / intermediate 12288, no num_experts.
-# Off by default (the 9B lanes were descoped); kept correct in case they come back.
-# FeedForward.forward shards the intermediate the same way, hence --tp 4 on the rt lane.
-DENSE9B="--dense-ffn --hidden-size 4096 --intermediate-size 12288"
+# ---- 9B bf16: DENSE model, no MoE at all (descoped; off by default) ------------
+DENSE9B=(--dense-ffn --hidden-size 4096 --intermediate-size 12288)
 if has 9b_rt; then
-  # shellcheck disable=SC2086
-  run 9b_rt_decode  $DENSE9B --phase decode  --batch 1 --mode both --check \
-      --tp 4 --threads "$THREADS_RT" --iters 20 --warmup 5
-  # shellcheck disable=SC2086
-  run 9b_rt_prefill $DENSE9B --phase prefill --batch 1 --mode both \
-      --tp 4 --threads "$THREADS_RT" --iters 10 --warmup 3
+  spread 9b_rt_decode  "$SPREAD_RT" "$CORES" "${DENSE9B[@]}" --phase decode --batch 1 \
+      --mode both --check --tp 4 --iters 20 --warmup 5
+  spread 9b_rt_prefill "$SPREAD_RT" "$CORES" "${DENSE9B[@]}" --phase prefill --batch 1 \
+      --mode both --tp 4 --iters 10 --warmup 3
 fi
 if has 9b_thr; then
-  # shellcheck disable=SC2086
-  run 9b_thr_decode  $DENSE9B --phase decode  --batch 96 --mode both --check \
-      --threads "$THREADS_THR" --iters 20 --warmup 5
-  # shellcheck disable=SC2086
-  run 9b_thr_prefill $DENSE9B --phase prefill --batch 96 --mode both \
-      --threads "$THREADS_THR" --iters 5 --warmup 2
+  spread 9b_thr_decode  "$SPREAD_THR" "$THREADS_THR" "${DENSE9B[@]}" --phase decode \
+      --batch 96 --mode both --check --iters 20 --warmup 5
+  spread 9b_thr_prefill "$SPREAD_THR" "$THREADS_THR" "${DENSE9B[@]}" --phase prefill \
+      --batch 96 --mode both --iters 5 --warmup 2
+fi
+
+# ---- state after, so any drift during the run is visible ----------------------
+{
+  echo "date        : $(date -Is)"
+  echo "governor    : $(gov)   (epp $(epp))"
+  echo "uptime      : $(uptime)"
+} | tee "$OUT/env_after.txt"
+GOV_AFTER=$(gov)
+if [ "$GOV_BEFORE" != "$GOV_AFTER" ]; then
+  echo "WARNING: governor changed under us during the run: $GOV_BEFORE -> $GOV_AFTER" >&2
+  echo "         (this script never sets it, so someone else did)" >&2
 fi
 
 echo
-echo "done. rows in $OUT/results.csv:"
-wc -l < "$OUT/results.csv"
+echo "done. per-instance CSVs:"
+wc -l "$OUT"/results.inst*.csv 2>/dev/null || echo "  none written"
