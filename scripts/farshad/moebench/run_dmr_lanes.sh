@@ -106,7 +106,7 @@ GOV_BEFORE=$(gov)
 if [ "$FORCE" != "1" ]; then
   L1=$(awk '{print $1}' /proc/loadavg)
   if awk -v l="$L1" -v m="$MAXLOAD" 'BEGIN{exit !(l>m)}'; then
-    echo "REFUSING: 1-min load average $L1 > MAXLOAD $m -- the box is busy, and a" >&2
+    echo "REFUSING: 1-min load average $L1 > MAXLOAD $MAXLOAD -- the box is busy, and a" >&2
     echo "          contended measurement is worse than no measurement. Wait, or FORCE=1." >&2
     exit 1
   fi
