@@ -134,47 +134,39 @@ def build_topk_ids(counts: List[int], num_tokens: int, topk: int):
 # ---------------------------------------------------------------------------
 
 class FusedExpertsCaller:
-    """Bind `fused_experts_cpu` arguments by NAME from its registered schema."""
+    """Call `fused_experts_cpu` with arguments bound BY NAME, on whichever of the two
+    registration styles the installed build uses:
 
-    # Values we supply, keyed by the schema's argument names. Anything the schema
-    # asks for that is not here is left at its default (or None if optional).
-    def __init__(self, prepack: bool, inplace: bool, activation: str):
-        import torch
-        self.torch = torch
-        try:
-            self.op = torch.ops.sgl_kernel.fused_experts_cpu
-        except (AttributeError, RuntimeError) as exc:
-            raise RuntimeError(
-                "torch.ops.sgl_kernel.fused_experts_cpu is not registered. Import the "
-                "build that provides it (`import sgl_kernel`) before running, or use "
-                "--mode batched / --dry-run.") from exc
-        self.schema = self.op.default._schema
-        self.names = [a.name for a in self.schema.arguments]
-        self.prepack = prepack
-        self.inplace = inplace
-        self.activation = activation
-        self.pack = getattr(torch.ops.sgl_kernel, "convert_weight_packed", None)
-        if prepack and self.pack is None:
-            raise RuntimeError("--prepack requested but sgl_kernel.convert_weight_packed "
-                               "is not registered in this build")
+      torch.ops   sgl_kernel registers through TORCH_LIBRARY, so the op carries a real
+                  schema and argument names/types come from it. Upstream main and the
+                  qwen35-bkc container.
+      pybind      the CPU-optimised fork (llama4_optimzed_cpu and friends) registers
+                  through PYBIND11_MODULE as sgl_kernel.common_ops.*, which has no
+                  schema. Names come from the Python wrapper in sgl_kernel/cpu.py via
+                  inspect.signature instead.
 
-    def prepack_weight(self, w):
-        return self.pack(w) if self.prepack else w
+    Both are needed: the signature differs across builds in count AND in kind (the fork
+    takes `use_int8_w8a8: bool` where newer builds take `moe_comp_method: int`, and the
+    fork has no `activation` argument at all -- SiLU is compiled in). Binding by name
+    off whatever the build actually exposes is what lets one script run on both.
+    """
 
-    def describe(self) -> str:
-        return str(self.schema)
-
-    def __call__(self, a, w1, w2, topk_weights, topk_ids):
-        supplied = {
+    # Everything the harness can supply, keyed by argument name. Any name a build asks
+    # for that is absent here falls back to that argument's default, or None if optional.
+    def _supplied(self, a, w1, w2, topk_weights, topk_ids) -> Dict[str, object]:
+        return {
             "hidden_states": a,
-            "input": a,          # older builds name it `input`
+            "x": a,              # the fork's wrapper calls it x
+            "input": a,          # some older builds call it input
             "w1": w1,
+            "w13_weight": w1,    # the fork's wrapper name for the fused gate+up weight
             "w2": w2,
+            "w2_weight": w2,
             "topk_weights": topk_weights,
             "topk_ids": topk_ids,
             "inplace": self.inplace,
-            # UNQUANT. Named `moe_comp_method` in the container build and `quant` /
-            # `quant_method` upstream; all take the same 0 == unquantized bf16.
+            # Unquantized bf16. Spelled `moe_comp_method`/`quant`/`quant_method` (0) in
+            # newer builds and `use_int8_w8a8` (False) in the fork.
             "moe_comp_method": 0,
             "quant": 0,
             "quant_method": 0,
@@ -183,19 +175,77 @@ class FusedExpertsCaller:
             "is_vnni": self.prepack,
             "activation": self.activation,
         }
-        args = []
-        for arg in self.schema.arguments:
-            if arg.name in supplied:
-                args.append(supplied[arg.name])
-            elif arg.has_default_value():
-                args.append(arg.default_value)
-            elif "Optional" in str(arg.type) or str(arg.type).endswith("?"):
-                args.append(None)
-            else:
+
+    def __init__(self, prepack: bool, inplace: bool, activation: str):
+        import torch
+        self.torch = torch
+        self.prepack = prepack
+        self.inplace = inplace
+        self.activation = activation
+
+        self.kind = None
+        op = getattr(getattr(torch.ops, "sgl_kernel", None), "fused_experts_cpu", None)
+        if op is not None:
+            self.kind = "torch.ops"
+            self.op = op
+            self.schema = op.default._schema
+            self.arg_names = [x.name for x in self.schema.arguments]
+            self.pack = torch.ops.sgl_kernel.convert_weight_packed
+        else:
+            import inspect
+            try:
+                from sgl_kernel import cpu as sk_cpu
+                import sgl_kernel
+            except ImportError as exc:
                 raise RuntimeError(
-                    f"fused_experts_cpu argument {arg.name!r} ({arg.type}) is required by "
-                    f"this build but the harness does not know how to fill it. Schema:\n"
-                    f"  {self.schema}")
+                    "no sgl_kernel CPU MoE kernel found: neither "
+                    "torch.ops.sgl_kernel.fused_experts_cpu nor sgl_kernel.cpu. Install "
+                    "a CPU-enabled sgl-kernel build, or use --mode batched / --dry-run."
+                ) from exc
+            self.kind = "pybind"
+            self.op = sk_cpu.fused_experts
+            self.schema = inspect.signature(self.op)
+            self.arg_names = list(self.schema.parameters)
+            self.pack = sgl_kernel.common_ops.convert_weight_packed
+        if prepack and self.pack is None:
+            raise RuntimeError("prepacking requested but convert_weight_packed is not "
+                               "available in this build (pass --no-prepack)")
+
+    def prepack_weight(self, w):
+        return self.pack(w) if self.prepack else w
+
+    def describe(self) -> str:
+        if self.kind == "torch.ops":
+            return f"[torch.ops] {self.schema}"
+        return f"[pybind] fused_experts{self.schema}"
+
+    def __call__(self, a, w1, w2, topk_weights, topk_ids):
+        supplied = self._supplied(a, w1, w2, topk_weights, topk_ids)
+        args = []
+        if self.kind == "torch.ops":
+            for arg in self.schema.arguments:
+                if arg.name in supplied:
+                    args.append(supplied[arg.name])
+                elif arg.has_default_value():
+                    args.append(arg.default_value)
+                elif "Optional" in str(arg.type) or str(arg.type).endswith("?"):
+                    args.append(None)
+                else:
+                    raise RuntimeError(
+                        f"fused_experts_cpu argument {arg.name!r} ({arg.type}) is required "
+                        f"by this build but the harness cannot fill it. Schema:\n"
+                        f"  {self.schema}")
+        else:
+            import inspect
+            for name, param in self.schema.parameters.items():
+                if name in supplied:
+                    args.append(supplied[name])
+                elif param.default is not inspect.Parameter.empty:
+                    args.append(param.default)
+                else:
+                    raise RuntimeError(
+                        f"fused_experts_cpu argument {name!r} is required by this build "
+                        f"but the harness cannot fill it. Signature:\n  {self.schema}")
         return self.op(*args)
 
 
