@@ -178,12 +178,60 @@ docker run --rm \
 Warm the cache on the host once (`--dry-run` is enough) if the container has no
 network, then pass `--ab-offline` inside it.
 
+## Dense models, and TP
+
+**`--dense-ffn`** benchmarks a dense SwiGLU FFN instead of an MoE layer, as the
+`num_experts=1` case — which is how archbench itself models it
+(`common/swiglu_block.py`: *"num_experts=1 is the dense FFN case"*), using the same
+`BatchedSwiGLU` primitive the expert groups are built from. It reads no stats, because
+a dense model has no experts to collect. Needed for the dense lanes of the daily run:
+
+```bash
+python3 bench_moe_cpu.py --dense-ffn --hidden-size 4096 --intermediate-size 12288 \
+    --phase prefill --batch 96
+```
+
+**`--tp N`** shards `moe_intermediate_size` by `N`, i.e. what ONE rank executes (all
+`E` experts kept, `N -> N/tp`). The stats are still looked up under the *unsharded*
+model key, since routing is a property of the model, not of the split.
+
+This matters because **archbench's `Qwen3_5MoeExperts` does not shard the MoE at all** —
+it passes `config.moe_intermediate_size` and `config.num_experts` straight through with
+no `model_parallel_size` division, unlike attention (`n_local_kv_heads =
+ceil(n_kv_heads/MP)`) and vocab. So `--tp 1` is what the projection charges per rank and
+`--tp 4` is what a real sglang TP4 rank runs. Measured at the rt prefill cell (bs1 L0,
+32 threads): 17.65 ms unsharded vs **3.81 ms** at `--tp 4`, a 4.6× gap.
+
+## Running the daily-run lanes
+
+`run_dmr_lanes.sh` encodes the bf16 lanes of the qwen35 DMR-X4 daily run
+(`qwen35_dmrx4_lanes_20260903_1119_collmodes_shmprofile.csv`) so a whole sweep is one
+command. Lanes: `35b_rt` (bs1, TP4 rank, 56c), `35b_rt_tp4shard` (same with `--tp 4`),
+`35b_thr` (bs320, TP1, 224c), `9b_rt` / `9b_thr` (dense, bs1 / bs96).
+
+```bash
+OUT=run1 LANES="35b_rt 35b_thr" LAYERS=all THREADS_RT=56 THREADS_THR=224 \
+    bash run_dmr_lanes.sh
+```
+
+Knobs: `OUT` `THREADS_RT` `THREADS_THR` `LAYERS` `AB` `PY` `LANES`. It records
+`hostname`, `numactl --hardware`, `lscpu` and the git sha into `$OUT/env.txt` — the DMR
+box's SNC state flips across reboots, so the topology has to be captured per run, not
+assumed.
+
+Cost to plan around, measured on GNR96C: **35B bs320 prefill is 19.74 TFLOP/layer**
+(3.14 M routed slots, 392,275 tokens fed) at 6.48 s/iter — so it gets few iterations on
+purpose. It is also the **+19.7% mass-overshoot** cell. That overshoot inflates the
+absolute time, but *not* the projection-vs-measured ratio: both sides consume the
+identical histogram.
+
 ## Files
 
 * `bench_moe_cpu.py` — driver: CLI, routing table, timing, CSV output
 * `moe_stats.py` — CSV readers + validation, ported from archbench
   `qwen3_moe_expert_dist_utils.py`
 * `archbench_stats.py` — resolves and caches stats files out of the archbench repo
+* `run_dmr_lanes.sh` — the daily-run lanes as one sweep
 
 ## Measured on GNR96C, `qwen35-bkc:latest`, 32 threads, 5 iters
 
