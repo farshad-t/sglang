@@ -7,7 +7,7 @@
 # hw dmr_ap_x4_16ch_224c_128cbo_ddr8000):
 #
 #   lane 3/4   qwen35_035b_bs001_TP4_bf16_a003b    rt   bs1    TP4  numUnits [56]
-#   lane 9/10  qwen35_035b_bs320_TP1_bf16_a003b    thr  bs320  TP1  (whole socket)
+#   lane 9/10  qwen35_035b_bs320_TP1_bf16_a003b    thr  bs320  TP1  (4 replicas x 56c)
 #   lane 1/2   qwen35_009b_bs001_TP4_bf16          rt   bs1    TP4  (DENSE model)
 #   lane 7/8   qwen35_009b_bs096_TP1_bf16          thr  bs96   TP1  (DENSE model)
 #
@@ -20,9 +20,11 @@
 # the same layer at the same time. Per-instance times are reported separately; the
 # slowest instance is what a rank actually waits for.
 #
-# The thr lanes are TP1 over the whole socket, so a single 224-core instance already
-# leaves nothing idle and the same concern does not apply. SPREAD_THR=4 runs them
-# 4-way anyway (i.e. four independent model instances) if you want that contrast.
+# The thr lanes are ALSO four concurrent 56-core instances, for a different reason:
+# TP1 means no sharding, so a throughput deployment on this socket is four INDEPENDENT
+# model replicas, one per 56-core group, each running the FULL unsharded layer
+# (N=512). Same core layout as rt, opposite sharding. A single 224-core instance is
+# NOT the throughput lane; it is available as 35b_thr_socket for contrast only.
 #
 # SNC is OFF on this box (1 NUMA node, cores 0-223), and numactl is not installed,
 # so pinning is taskset + OMP_PLACES/OMP_PROC_BIND. There is no per-node membind to
@@ -52,14 +54,14 @@
 #   OUT=<dir>            output dir                  (default results_<timestamp>)
 #   CORES=56             cores per instance
 #   SPREAD_RT=4          concurrent instances for rt lanes
-#   SPREAD_THR=1         concurrent instances for thr lanes
-#   THREADS_THR=224      threads for a single-instance thr run
+#   SPREAD_THR=4         concurrent instances for thr lanes
+#   THREADS_THR=224      threads for the single-instance 35b_thr_socket contrast
 #   LAYERS=all           --layer for the 35B lanes (e.g. 0,10,20,30,39 to sample)
 #   MAXLOAD=2.0          refuse to start above this 1-min load average
 #   AB="..."             extra stats-source flags, e.g. AB="--ab-offline"
 #   PY=python3           interpreter
 #   FORCE=1              skip the busy/governor guards
-#   LANES="..."          subset of: 35b_rt 35b_rt_unsharded 35b_thr 35b_thr_spread
+#   LANES="..."          subset of: 35b_rt 35b_rt_unsharded 35b_thr 35b_thr_socket
 #                        35b_shared_rt 35b_shared_thr 9b_rt 9b_thr
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -67,7 +69,7 @@ cd "$(dirname "$0")"
 OUT=${OUT:-results_$(date +%Y%m%d_%H%M%S)}
 CORES=${CORES:-56}
 SPREAD_RT=${SPREAD_RT:-4}
-SPREAD_THR=${SPREAD_THR:-1}
+SPREAD_THR=${SPREAD_THR:-4}
 THREADS_THR=${THREADS_THR:-224}
 LAYERS=${LAYERS:-all}
 MAXLOAD=${MAXLOAD:-2.0}
@@ -172,20 +174,23 @@ if has 35b_rt_unsharded; then
       --layer "$LAYERS" --mode both --iters 10 --warmup 3
 fi
 
-# ---- 35B-A3B bf16 throughput: bs320, TP1, ONE instance over all 224 cores ------
-# One 224-core instance leaves no core idle, so it needs no spread. bs320 prefill is
-# the heaviest cell by far (~19.7 TFLOP/layer, 392k tokens fed) -- few iterations.
+# ---- 35B-A3B bf16 throughput: bs320, TP1 = 4 INDEPENDENT 56-core replicas ------
+# TP1 means no sharding, so each of the four concurrent instances runs the FULL layer
+# at N=512 (hence no --tp flag). Same core layout as the rt lanes, opposite sharding.
+# bs320 prefill is the heaviest cell by far (~19.7 TFLOP/layer per instance, 392k
+# tokens fed, x4 concurrent) -- few iterations on purpose.
 if has 35b_thr; then
-  spread 35b_thr_decode  "$SPREAD_THR" "$THREADS_THR" --phase decode  --batch 320 \
+  spread 35b_thr_decode  "$SPREAD_THR" "$CORES" --phase decode  --batch 320 \
       --layer "$LAYERS" --mode both --iters 10 --warmup 3
-  spread 35b_thr_prefill "$SPREAD_THR" "$THREADS_THR" --phase prefill --batch 320 \
+  spread 35b_thr_prefill "$SPREAD_THR" "$CORES" --phase prefill --batch 320 \
       --layer "$LAYERS" --mode fused --iters 3 --warmup 1
 fi
 
-# ---- thr lane as 4 independent 56-core instances (contrast) --------------------
-if has 35b_thr_spread; then
-  spread 35b_thr_spread_decode 4 "$CORES" --phase decode --batch 320 --layer "$LAYERS" \
-      --mode both --iters 10 --warmup 3
+# ---- contrast: the same bs320 cell as ONE instance over all 224 cores ----------
+# Not the throughput lane. Isolates one-big-instance vs four-replica scaling.
+if has 35b_thr_socket; then
+  spread 35b_thr_socket_decode 1 "$THREADS_THR" --phase decode --batch 320 \
+      --layer "$LAYERS" --mode both --iters 10 --warmup 3
 fi
 
 # ---- 35B SHARED expert (dense, K=2048, N=512) ---------------------------------
@@ -200,9 +205,9 @@ if has 35b_shared_rt; then
       --batch 1 --mode both --tp 4 --iters 10 --warmup 3
 fi
 if has 35b_shared_thr; then
-  spread 35b_shared_thr_decode  "$SPREAD_THR" "$THREADS_THR" "${SHARED35B[@]}" \
+  spread 35b_shared_thr_decode  "$SPREAD_THR" "$CORES" "${SHARED35B[@]}" \
       --phase decode --batch 320 --mode both --check --iters 20 --warmup 5
-  spread 35b_shared_thr_prefill "$SPREAD_THR" "$THREADS_THR" "${SHARED35B[@]}" \
+  spread 35b_shared_thr_prefill "$SPREAD_THR" "$CORES" "${SHARED35B[@]}" \
       --phase prefill --batch 320 --mode both --iters 3 --warmup 1
 fi
 
@@ -215,9 +220,9 @@ if has 9b_rt; then
       --mode both --tp 4 --iters 10 --warmup 3
 fi
 if has 9b_thr; then
-  spread 9b_thr_decode  "$SPREAD_THR" "$THREADS_THR" "${DENSE9B[@]}" --phase decode \
+  spread 9b_thr_decode  "$SPREAD_THR" "$CORES" "${DENSE9B[@]}" --phase decode \
       --batch 96 --mode both --check --iters 20 --warmup 5
-  spread 9b_thr_prefill "$SPREAD_THR" "$THREADS_THR" "${DENSE9B[@]}" --phase prefill \
+  spread 9b_thr_prefill "$SPREAD_THR" "$CORES" "${DENSE9B[@]}" --phase prefill \
       --batch 96 --mode both --iters 5 --warmup 2
 fi
 
