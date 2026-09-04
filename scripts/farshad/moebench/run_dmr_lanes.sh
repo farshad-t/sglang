@@ -57,7 +57,9 @@
 #   SPREAD_THR=4         concurrent instances for thr lanes
 #   THREADS_THR=224      threads for the single-instance 35b_thr_socket contrast
 #   LAYERS=all           --layer for the 35B lanes (e.g. 0,10,20,30,39 to sample)
-#   MAXLOAD=2.0          refuse to start above this 1-min load average
+#   MAXOTHER_CPU=200     refuse to start if OTHER users are burning more than this
+#                        much CPU (percent; 200 = 2 cores). Load average is not used
+#                        for the decision -- see the guard.
 #   AB="..."             extra stats-source flags, e.g. AB="--ab-offline"
 #   PY=python3           interpreter
 #   COOLDOWN=60          seconds of idle between cells, for the part to settle
@@ -75,7 +77,7 @@ SPREAD_RT=${SPREAD_RT:-4}
 SPREAD_THR=${SPREAD_THR:-4}
 THREADS_THR=${THREADS_THR:-224}
 LAYERS=${LAYERS:-all}
-MAXLOAD=${MAXLOAD:-2.0}
+MAXOTHER_CPU=${MAXOTHER_CPU:-200}
 AB=${AB:-}
 PY=${PY:-python3}
 FORCE=${FORCE:-0}
@@ -151,11 +153,23 @@ GOV_BEFORE=$(gov)
 } | tee "$OUT/env_before.txt"
 
 # ---- guards -------------------------------------------------------------------
+# "Is the box busy?" means "is someone ELSE using it", and the 1-min load average
+# cannot answer that: it decays over minutes, so it still reads 60+ right after our
+# own previous sweep exits. Using it refused three legitimate launches in a row on an
+# otherwise idle machine. So the decision is made on CPU currently burned by other
+# users; load is recorded for context but never gates.
+other_cpu() {
+  ps -eo user,pcpu --no-headers 2>/dev/null \
+    | awk -v me="$(id -un)" '$1 != me { s += $2 } END { printf "%d", s + 0 }'
+}
+
 if [ "$FORCE" != "1" ]; then
+  OTHER=$(other_cpu)
   L1=$(awk '{print $1}' /proc/loadavg)
-  if awk -v l="$L1" -v m="$MAXLOAD" 'BEGIN{exit !(l>m)}'; then
-    echo "REFUSING: 1-min load average $L1 > MAXLOAD $MAXLOAD -- the box is busy, and a" >&2
-    echo "          contended measurement is worse than no measurement. Wait, or FORCE=1." >&2
+  if [ "$OTHER" -gt "$MAXOTHER_CPU" ]; then
+    echo "REFUSING: other users are burning ${OTHER}% CPU (> MAXOTHER_CPU" \
+         "${MAXOTHER_CPU}%). A contended measurement is worse than none." >&2
+    ps -eo user,pcpu,comm --sort=-pcpu --no-headers | head -6 >&2
     exit 1
   fi
   if [ "$GOV_BEFORE" != "performance" ]; then
@@ -165,7 +179,8 @@ if [ "$FORCE" != "1" ]; then
     echo "          anyway (and say so in the writeup)." >&2
     exit 1
   fi
-  echo "guards ok: load $L1 <= $MAXLOAD, governor $GOV_BEFORE"
+  echo "guards ok: other-user CPU ${OTHER}% <= ${MAXOTHER_CPU}%, governor $GOV_BEFORE" \
+       "(1-min load $L1, not gating)"
 fi
 
 # ---- one cell, N concurrent pinned instances ----------------------------------
