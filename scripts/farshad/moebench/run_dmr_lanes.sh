@@ -60,6 +60,9 @@
 #   MAXLOAD=2.0          refuse to start above this 1-min load average
 #   AB="..."             extra stats-source flags, e.g. AB="--ab-offline"
 #   PY=python3           interpreter
+#   COOLDOWN=60          seconds of idle between cells, for the part to settle
+#   TEMP_MAX=80          do not start the next cell above this package temp (C)
+#   COOLDOWN_MAX=600     give up waiting to cool after this long, and say so
 #   FORCE=1              skip the busy/governor guards
 #   LANES="..."          subset of: 35b_rt 35b_rt_unsharded 35b_thr 35b_thr_socket
 #                        35b_shared_rt 35b_shared_thr 9b_rt 9b_thr
@@ -76,11 +79,54 @@ MAXLOAD=${MAXLOAD:-2.0}
 AB=${AB:-}
 PY=${PY:-python3}
 FORCE=${FORCE:-0}
+COOLDOWN=${COOLDOWN:-60}
+TEMP_MAX=${TEMP_MAX:-80}
+COOLDOWN_MAX=${COOLDOWN_MAX:-600}
 LANES=${LANES:-"35b_rt 35b_rt_unsharded 35b_thr 35b_shared_rt 35b_shared_thr"}
 
 mkdir -p "$OUT"
 
 gov() { cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo unknown; }
+
+# Hottest package across the SNC die regions. x86_pkg_temp is one zone per region.
+pkgtemp() {
+  local m=0 t
+  for z in /sys/class/thermal/thermal_zone*; do
+    [ -r "$z/temp" ] || continue
+    [ "$(cat "$z/type" 2>/dev/null)" = "x86_pkg_temp" ] || continue
+    t=$(( $(cat "$z/temp") / 1000 )); [ "$t" -gt "$m" ] && m=$t
+  done
+  echo "$m"
+}
+
+# Throttle counters are the evidence that a cell was derated. A cell whose count
+# moved was measured on a clock the next cell will not see, so it is not comparable.
+throttles() {
+  echo "core=$(cat /sys/devices/system/cpu/cpu0/thermal_throttle/core_throttle_count 2>/dev/null || echo NA)"\
+"/pkg=$(cat /sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_count 2>/dev/null || echo NA)"
+}
+
+# Idle between cells so the part settles, and refuse to start the next one while it is
+# still hot. Sustained 224-core AMX is the heaviest thing this box will ever run, and a
+# cell begun on an already-saturated thermal budget both risks the machine and measures
+# a clock the previous cell did not see.
+cool_down() {
+  local label="$1" t0 waited t
+  t0=$(date +%s)
+  while :; do
+    t=$(pkgtemp); waited=$(( $(date +%s) - t0 ))
+    if [ "$t" -le "$TEMP_MAX" ] && [ "$waited" -ge "$COOLDOWN" ]; then
+      echo "  cooled: ${t}C after ${waited}s idle (limit ${TEMP_MAX}C, min ${COOLDOWN}s)"
+      break
+    fi
+    if [ "$waited" -ge "$COOLDOWN_MAX" ]; then
+      echo "  WARNING: still ${t}C after ${waited}s, proceeding anyway (COOLDOWN_MAX)"
+      break
+    fi
+    sleep 10
+  done
+  echo "$(date -Is) after=$label temp=${t}C throttle=$(throttles)" >> "$OUT/thermal.log"
+}
 epp() { cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference 2>/dev/null || echo unknown; }
 
 GOV_BEFORE=$(gov)
@@ -96,6 +142,8 @@ GOV_BEFORE=$(gov)
   echo "cpu         :"; lscpu 2>/dev/null | grep -E '^(Model name|Socket|Core|Thread|NUMA node\(s\)|CPU max)' | sed 's/^/  /'
   echo "bios        : $(cat /sys/class/dmi/id/bios_version 2>/dev/null || echo n/a)"
   echo "cores/inst  : $CORES"
+  echo "cooldown    : ${COOLDOWN}s min between cells, wait until <=${TEMP_MAX}C (cap ${COOLDOWN_MAX}s)"
+  echo "pkg temp now: $(pkgtemp)C   throttle: $(throttles)"
   echo "spread rt   : $SPREAD_RT   thr: $SPREAD_THR"
   echo "layers      : $LAYERS"
   echo "git         : $(git rev-parse HEAD 2>/dev/null || echo n/a)"
@@ -132,10 +180,14 @@ spread() {  # spread <name> <n_instances> <cores_per_instance> <args...>
   local name=$1 n=$2 cores=$3; shift 3
   echo
   echo "################ $name   (${n} x ${cores}c concurrent, barrier-synced)"
+  echo "$(date -Is) before=$name temp=$(pkgtemp)C throttle=$(throttles)" >> "$OUT/thermal.log"
+  echo "  pre-cell: $(pkgtemp)C, throttle $(throttles)"
   # shellcheck disable=SC2086
   $PY bench_moe_cpu.py "$@" --instances "$n" --cores-per-instance "$cores" $AB \
       --out "$OUT/results.csv" 2>&1 | tee "$OUT/$name.log" \
     | grep -E "spread:|imbalance|^ +[0-9]+\.[0-9]+x|median imbalance|fused_experts_cpu:|batched GEMMs:|check:|REFUS|Error" || true
+  echo "  post-cell: $(pkgtemp)C, throttle $(throttles)"
+  cool_down "$name"
 }
 
 has() { [[ " $LANES " == *" $1 "* ]]; }
