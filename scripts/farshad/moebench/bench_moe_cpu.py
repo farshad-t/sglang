@@ -253,11 +253,27 @@ class FusedExpertsCaller:
 # the two things we time
 # ---------------------------------------------------------------------------
 
-def time_it(fn, warmup: int, iters: int) -> Dict[str, float]:
+def time_it(fn, warmup: int, iters: int, barrier=None) -> Dict[str, float]:
+    """`barrier` re-syncs the concurrent instances before EVERY iteration.
+
+    Without it, instances that start together drift apart within a few
+    iterations, because per-layer work differs and nothing pulls them back. Once
+    drifted, an instance can be timed while its neighbours are between kernels
+    -- so it measures a partly-idle socket, which is the distortion the spread
+    exists to avoid. A per-iteration barrier makes every timed window contain
+    all instances, so any residual imbalance is real asymmetry rather than
+    scheduling luck.
+    """
+    def sync():
+        if barrier is not None:
+            barrier.wait()
+
     for _ in range(warmup):
+        sync()
         fn()
     samples = []
     for _ in range(iters):
+        sync()
         t0 = time.perf_counter()
         fn()
         samples.append((time.perf_counter() - t0) * 1e3)
@@ -452,6 +468,16 @@ def main() -> int:
     p.add_argument("--check-rtol", type=float, default=2e-2,
                    help="max relative error the --check comparison tolerates. bf16 "
                         "inputs accumulated over K=2048 make ~1e-2 normal.")
+    p.add_argument("--instances", type=int, default=1,
+                   help="run this many pinned instances CONCURRENTLY, re-synchronised on "
+                        "a barrier before every iteration. 4 with --cores-per-instance 56 "
+                        "is one TP4 rank per 56-core group on a 224c socket.")
+    p.add_argument("--cores-per-instance", type=int, default=None,
+                   help="cores each instance is pinned to (default: nproc // instances)")
+    p.add_argument("--core-offset", type=int, default=0,
+                   help="first core of instance 0")
+    p.add_argument("--instance-index", type=int, default=0,
+                   help=argparse.SUPPRESS)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", default=None, help="append results to this CSV")
     p.add_argument("--dry-run", action="store_true",
@@ -500,6 +526,122 @@ def main() -> int:
         print(f"cached {n} files under {src.files_dir}")
         return 0
 
+    if args.instances > 1:
+        return run_spread(args)
+    rows = run_cells(args, model, model_key)
+    write_rows(args, rows)
+    return 0
+
+
+def _instance_main(idx: int, cores: List[int], barrier, queue, args, model, model_key):
+    """One pinned instance. Affinity and the OpenMP policy are set BEFORE torch is
+    imported, because both are read when the thread pool is first built."""
+    os.sched_setaffinity(0, set(cores))
+    os.environ["OMP_NUM_THREADS"] = str(len(cores))
+    os.environ["OMP_PROC_BIND"] = "close"
+    os.environ["OMP_PLACES"] = "cores"
+    # Idle OpenMP threads busy-wait by default (libgomp OMP_WAIT_POLICY, libiomp
+    # KMP_BLOCKTIME=200ms). With 4 x 56 threads that means an instance between
+    # kernels burns its cores at 100%, stealing frequency headroom from the others
+    # and making the groups diverge. Passive/0 puts them to sleep instead.
+    os.environ["OMP_WAIT_POLICY"] = "passive"
+    os.environ["KMP_BLOCKTIME"] = "0"
+    # KMP_AFFINITY would override OMP_PLACES/OMP_PROC_BIND and uses absolute proc
+    # ids, which mis-place under a restricted affinity mask.
+    os.environ.pop("KMP_AFFINITY", None)
+    args.threads = len(cores)
+    args.instance_index = idx
+    try:
+        rows = run_cells(args, model, model_key, barrier=barrier,
+                         tag_prefix=f"[inst{idx} cores {cores[0]}-{cores[-1]}] ")
+        queue.put((idx, rows, None))
+    except BaseException as exc:  # noqa: BLE001 - reported to the parent verbatim
+        import traceback
+        queue.put((idx, [], traceback.format_exc()))
+        raise SystemExit(1) from exc
+
+
+def run_spread(args) -> int:
+    """Run `--instances` copies of the same cells concurrently, each pinned to its own
+    core group, all re-synchronised before every timed iteration."""
+    import multiprocessing as mp
+
+    ncpu = len(os.sched_getaffinity(0))
+    per = args.cores_per_instance or ncpu // args.instances
+    need = args.core_offset + per * args.instances
+    if need > ncpu:
+        raise SystemExit(f"--instances {args.instances} x --cores-per-instance {per} "
+                         f"(+offset {args.core_offset}) needs {need} cores but only "
+                         f"{ncpu} are available")
+    groups = [list(range(args.core_offset + i * per, args.core_offset + (i + 1) * per))
+              for i in range(args.instances)]
+    print(f"spread: {args.instances} instances x {per} cores, barrier-synced per "
+          f"iteration: " + ", ".join(f"{g[0]}-{g[-1]}" for g in groups))
+
+    model_key = f"{args.hidden_size}-{args.num_experts}-{args.moe_intermediate_size}"
+    model = dict(hidden_size=args.hidden_size, num_experts=args.num_experts,
+                 moe_intermediate_size=args.moe_intermediate_size // args.tp,
+                 topk=args.topk)
+
+    ctx = mp.get_context("spawn")
+    barrier = ctx.Barrier(args.instances)
+    queue = ctx.Queue()
+    procs = [ctx.Process(target=_instance_main,
+                         args=(i, groups[i], barrier, queue, args, model, model_key))
+             for i in range(args.instances)]
+    for p in procs:
+        p.start()
+    collected, failures = {}, {}
+    for _ in procs:
+        idx, rows, err = queue.get()
+        collected[idx] = rows
+        if err:
+            failures[idx] = err
+    for p in procs:
+        p.join()
+
+    if failures:
+        for idx, err in sorted(failures.items()):
+            print(f"\ninstance {idx} FAILED:\n{err}", file=sys.stderr)
+        raise SystemExit(f"{len(failures)}/{args.instances} instances failed")
+
+    rows: List[Dict] = []
+    for idx in sorted(collected):
+        rows.extend(collected[idx])
+    write_rows(args, rows)
+    summarize_spread(rows, args.instances)
+    return 0
+
+
+def summarize_spread(rows: List[Dict], instances: int) -> None:
+    """Per cell, report the across-instance imbalance. With a per-iteration barrier
+    every instance ran in the same window, so a spread well above 1.0 is genuine
+    hardware asymmetry and not scheduling drift."""
+    cells: Dict[tuple, List[Dict]] = {}
+    for r in rows:
+        cells.setdefault((r["phase"], r["batch"], r["layer"]), []).append(r)
+    worst = []
+    for key, rs in sorted(cells.items()):
+        for mode in ("fused", "batched"):
+            vals = [r[f"{mode}_median_ms"] for r in rs if r.get(f"{mode}_median_ms")]
+            if len(vals) < 2:
+                continue
+            worst.append((max(vals) / min(vals), key, mode, min(vals), max(vals)))
+    if not worst:
+        return
+    worst.sort(reverse=True)
+    print(f"\nacross-instance imbalance ({instances} instances, barrier-synced), "
+          f"worst 5 cells:")
+    for spread, (phase, batch, layer), mode, lo, hi in worst[:5]:
+        print(f"  {spread:5.2f}x  {phase} bs{batch} L{layer} {mode:<8} "
+              f"{lo:.3f} .. {hi:.3f} ms")
+    med = statistics.median([w[0] for w in worst])
+    print(f"  median imbalance across all cells/modes: {med:.3f}x")
+
+
+def run_cells(args, model, model_key, barrier=None, tag_prefix="") -> List[Dict]:
+    K, N, E, topk = (model["hidden_size"], model["moe_intermediate_size"],
+                     model["num_experts"], model["topk"])
     if args.dense_ffn:
         csv_file, provenance, stats_commit = "", "dense FFN (synthetic, no stats)", ""
     else:
@@ -556,7 +698,7 @@ def main() -> int:
             # 2 flops/MAC; gate+up is K x 2N and down is N x K per routed slot.
             flops = 6.0 * (mass + slack) * K * N
 
-            print(f"\n{tag}")
+            print(f"\n{tag_prefix}{tag}")
             print(f"  histogram: {len(groups)} groups, {active}/{E} experts active, "
                   f"mass {mass} slots (routed_tokens {R}, {(mass - R) / R:+.1%})")
             print(f"  tokens fed: {num_tokens}"
@@ -568,6 +710,7 @@ def main() -> int:
             print(f"  work: {flops / 1e9:.2f} GFLOP")
 
             row = dict(phase=args.phase, batch=batch, layer=layer,
+                       instance=args.instance_index,
                        stats_commit=stats_commit,
                        stats_ref=args.ab_ref if stats_commit else "",
                        dtype=args.dtype,
@@ -598,14 +741,14 @@ def main() -> int:
 
             if args.mode in ("fused", "both"):
                 r = time_it(make_fused_runner(counts, num_tokens, model, caller, args.seed),
-                            args.warmup, args.iters)
+                            args.warmup, args.iters, barrier)
                 row.update({f"fused_{k}": v for k, v in r.items()})
                 print(f"  fused_experts_cpu: {r['median_ms']:.3f} ms median "
                       f"(min {r['min_ms']:.3f}, p90 {r['p90_ms']:.3f})  "
                       f"{flops / 1e9 / (r['median_ms'] / 1e3):.1f} GFLOP/s")
             if args.mode in ("batched", "both"):
                 r = time_it(make_batched_runner(groups, model, args.seed),
-                            args.warmup, args.iters)
+                            args.warmup, args.iters, barrier)
                 row.update({f"batched_{k}": v for k, v in r.items()})
                 print(f"  batched GEMMs:     {r['median_ms']:.3f} ms median "
                       f"(min {r['min_ms']:.3f}, p90 {r['p90_ms']:.3f})  "
@@ -617,6 +760,10 @@ def main() -> int:
                       f"({'fused wins' if ratio < 1 else 'batched wins'})")
             rows.append(row)
 
+    return rows
+
+
+def write_rows(args, rows: List[Dict]) -> None:
     if args.out and rows:
         fields: List[str] = []
         for r in rows:
@@ -630,7 +777,6 @@ def main() -> int:
                 w.writeheader()
             w.writerows(rows)
         print(f"\nwrote {len(rows)} rows to {args.out}")
-    return 0
 
 
 if __name__ == "__main__":

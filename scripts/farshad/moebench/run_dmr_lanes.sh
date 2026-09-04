@@ -121,39 +121,21 @@ if [ "$FORCE" != "1" ]; then
 fi
 
 # ---- one cell, N concurrent pinned instances ----------------------------------
-# Every instance runs the SAME shape at the SAME time so the socket is fully loaded,
-# then we join on all of them.
-spread() {  # spread <name> <n_instances> <threads_per_instance> <args...>
-  local name=$1 n=$2 thr=$3; shift 3
+# The concurrency now lives INSIDE bench_moe_cpu.py (--instances), not in this shell.
+# The shell version launched independent processes that started together and then
+# drifted apart, so a cell could be timed while its neighbours sat between kernels --
+# which measured a partly-idle socket and produced a 2.28x across-instance spread.
+# The Python driver re-synchronises all instances on a barrier before EVERY iteration
+# and sets OMP_WAIT_POLICY=passive / KMP_BLOCKTIME=0 so idle threads sleep instead of
+# busy-waiting on cores their neighbours need. Measured imbalance after: ~1.07x median.
+spread() {  # spread <name> <n_instances> <cores_per_instance> <args...>
+  local name=$1 n=$2 cores=$3; shift 3
   echo
-  echo "################ $name   (${n} x ${thr}t concurrent)"
-  local pids=() i lo hi
-  for ((i = 0; i < n; i++)); do
-    if [ "$n" -eq 1 ] && [ "$thr" -ge "$(nproc)" ]; then
-      lo=0; hi=$(( $(nproc) - 1 ))
-    else
-      lo=$(( i * CORES )); hi=$(( lo + CORES - 1 ))
-    fi
-    # shellcheck disable=SC2086
-    taskset -c "$lo-$hi" env \
-        OMP_NUM_THREADS="$thr" OMP_PROC_BIND=close OMP_PLACES=cores \
-        KMP_AFFINITY=granularity=fine,compact,1,0 \
-      $PY bench_moe_cpu.py "$@" --threads "$thr" $AB \
-        --out "$OUT/results.inst$i.csv" > "$OUT/$name.inst$i.log" 2>&1 &
-    pids+=($!)
-  done
-  local rc=0
-  for p in "${pids[@]}"; do wait "$p" || rc=1; done
-  for ((i = 0; i < n; i++)); do
-    printf '  inst%d [%s] ' "$i" "$( [ "$n" -eq 1 ] && echo "0-$(( $(nproc) - 1 ))" || echo "$(( i * CORES ))-$(( i * CORES + CORES - 1 ))" )"
-    grep -hE 'fused_experts_cpu:|batched GEMMs:|check:' "$OUT/$name.inst$i.log" | tr '\n' '|' | sed 's/  */ /g'
-    echo
-  done
-  if [ "$rc" != 0 ]; then
-    echo "  !! at least one instance failed -- see $OUT/$name.inst*.log" >&2
-    tail -5 "$OUT/$name.inst0.log" >&2
-  fi
-  return 0
+  echo "################ $name   (${n} x ${cores}c concurrent, barrier-synced)"
+  # shellcheck disable=SC2086
+  $PY bench_moe_cpu.py "$@" --instances "$n" --cores-per-instance "$cores" $AB \
+      --out "$OUT/results.csv" 2>&1 | tee "$OUT/$name.log" \
+    | grep -E "spread:|imbalance|^ +[0-9]+\.[0-9]+x|median imbalance|fused_experts_cpu:|batched GEMMs:|check:|REFUS|Error" || true
 }
 
 has() { [[ " $LANES " == *" $1 "* ]]; }
