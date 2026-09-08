@@ -385,8 +385,23 @@ def check_fused(counts, num_tokens, model, caller, seed, activation="silu"):
     return err / scale, err
 
 
-def make_batched_runner(groups, model, seed, copies: int = 1):
+def act_elems(groups, K: int) -> int:
+    """Activation elements the LARGEST group of a cell needs."""
+    return max(nexp * tokens * K for nexp, tokens in groups)
+
+
+def make_batched_runner(groups, model, seed, copies: int = 1, acts=None):
     """The projection's own decomposition: one batched GEMM pair per histogram bucket.
+
+    `acts` is ONE activation buffer, shared by every group and (via time_cells) every
+    cell of the leg. Groups run strictly in sequence and in the real block they all
+    read the same hidden states, so a per-group [nexp, tokens, K] tensor duplicated
+    each token row once per expert it routed to: topk times over, 12.9 GiB against
+    1.6 GiB of real activations at thr prefill, which is what made a 40-layer batched
+    leg not fit. Each group takes a contiguous PREFIX view, so no group hands bmm a
+    strided input it would have to copy. The reads themselves are unchanged -- the
+    decomposition still touches every routed slot's row, which is the traffic being
+    measured.
 
     Weights are cloned across `copies` so this leg streams from DDR on the same terms
     as the fused one -- comparing a cache-resident bmm against a DDR-bound kernel
@@ -396,18 +411,21 @@ def make_batched_runner(groups, model, seed, copies: int = 1):
     import torch.nn.functional as F
     K, N = model["hidden_size"], model["moe_intermediate_size"]
     g = torch.Generator().manual_seed(seed)
+    if acts is None:
+        acts = (torch.randn(act_elems(groups, K), generator=g,
+                            dtype=torch.float32) / 10).to(torch.bfloat16)
     work = []
     for nexp, tokens in groups:
-        a = (torch.randn((nexp, tokens, K), generator=g, dtype=torch.float32) / 10).to(torch.bfloat16)
         w1 = (torch.randn((nexp, K, 2 * N), generator=g, dtype=torch.float32) / 10).to(torch.bfloat16)
         w2 = (torch.randn((nexp, N, K), generator=g, dtype=torch.float32) / 10).to(torch.bfloat16)
-        work.append((a, w1, w2))
-    sets = [work] + [[(a, w1.clone(), w2.clone()) for a, w1, w2 in work]
+        work.append((nexp, tokens, w1, w2))
+    sets = [work] + [[(n, t, w1.clone(), w2.clone()) for n, t, w1, w2 in work]
                      for _ in range(copies - 1)]
     state = dict(i=0)
 
     def run():
-        for a, w1, w2 in sets[state["i"] % len(sets)]:
+        for nexp, tokens, w1, w2 in sets[state["i"] % len(sets)]:
+            a = acts[:nexp * tokens * K].view(nexp, tokens, K)
             h = torch.bmm(a, w1)
             gate, up = h.chunk(2, dim=-1)
             torch.bmm(F.silu(gate) * up, w2)
@@ -767,12 +785,12 @@ def pool_bytes(leg: str, cells: List[Dict], model, copies: int) -> int:
         # than the weights of a whole extra copy.
         weights = 2 * (E * 2 * N * K + E * K * N) * copies * len(cells)
         return weights + sum(2 * c["num_tokens"] * K for c in cells)
-    total = 0
-    for c in cells:
-        weights = sum(nexp * (K * 2 * N + N * K) for nexp, _ in c["groups"])
-        acts = sum(nexp * tokens * K for nexp, tokens in c["groups"])
-        total += 2 * (weights * copies + acts)
-    return total
+    # One activation buffer serves every group of every cell, so it is the max over
+    # cells and not a sum -- see make_batched_runner.
+    weights = sum(sum(nexp * (K * 2 * N + N * K) for nexp, _ in c["groups"])
+                  for c in cells)
+    acts = max(act_elems(c["groups"], K) for c in cells)
+    return 2 * (weights * copies + acts)
 
 
 def announce_pool(leg: str, cells: List[Dict], args, model) -> None:
@@ -828,8 +846,13 @@ def time_cells(args, model, caller, cells: List[Dict], barrier) -> None:
                 runners = [make(c["counts"], c["num_tokens"], model, caller, args.seed,
                                 copies=args.copies) for c in group]
             else:
-                runners = [make(c["groups"], model, args.seed, copies=args.copies)
-                           for c in group]
+                import torch
+                K = model["hidden_size"]
+                need = max(act_elems(c["groups"], K) for c in group)
+                acts = (torch.randn(need, generator=torch.Generator().manual_seed(
+                    args.seed), dtype=torch.float32) / 10).to(torch.bfloat16)
+                runners = [make(c["groups"], model, args.seed, copies=args.copies,
+                                acts=acts) for c in group]
             if not args.instance_index:
                 print(f"  pool built in {time.perf_counter() - t0:.1f} s")
             stats = time_mixed(runners, args.warmup, args.iters, barrier)
