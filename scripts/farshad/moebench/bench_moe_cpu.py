@@ -8,22 +8,28 @@ bucket of the measured expert histogram:
 
     groups = [expert_dist(num_experts, avg_tokens_per_expert) for each bucket]
 
-and each group costs one batched GEMM [nexp, tokens, K] x [nexp, K, 2N] (fused
-gate+up) plus [nexp, tokens, N] x [nexp, N, K] (down). This benchmark runs the
-SAME distribution on real silicon, so the projection can be compared against a
-measured number rather than against a whole-model end-to-end time that mixes in
-attention, KV, comms and framework overhead.
+and each group is one batched GEMM [nexp, tokens, K] x [nexp, K, 2N] (fused gate+up)
+plus [nexp, tokens, N] x [nexp, N, K] (down). This benchmark runs the SAME
+distribution on real silicon, so the projection can be compared against a measured
+number rather than against a whole-model end-to-end time that mixes in attention,
+KV, comms and framework overhead.
 
-It measures two things from one histogram, which is the point:
+It measures two things from one histogram:
 
   --mode fused     sglang's `fused_experts_cpu` -- what production actually runs.
-  --mode batched   the projection's own decomposition, as torch batched GEMMs.
-                   Same FLOPs, same shapes, one bmm per histogram bucket.
+  --mode batched   the same shapes as torch batched GEMMs, one bmm per bucket.
+                   Same FLOPs. A REFERENCE IMPLEMENTATION, not the projection's cost.
 
-fused vs batched isolates KERNEL QUALITY (does sglang's sorted-token AMX path
-beat/lag a plain batched GEMM at these shapes?) from MODEL ERROR (does the
-bucket-averaged decomposition predict the real kernel?). Running only one of them
-conflates the two.
+The batched leg carries the projection's SHAPE SET and NOT its cost model, so a
+fused/batched ratio is not projection error. archbench charges ideal_ops divided by
+a measured efficiency, and those eff sources (kfw-onednn + bdnn_silic) hold benchdnn
+oneDNN runs of these exact bucket shapes: summed over the 27 buckets of the qwen35
+thr-decode cell they come to 6.23 ms against a measured fused 6.36 ms, 1.02x, while
+this leg's torch.bmm takes 68 ms. That 10.7x is PyTorch per-call overhead at tiny M
+(2-159 tokens per expert over 54 bmm calls, 8% of DDR peak and 0.2% of AMX peak) --
+bf16 bmm does dispatch to oneDNN AMX brgemm, so it is not an ISA difference. Compare
+a fused measurement against the eff-source row or a projection result dir; use this
+leg only to say what an unoptimised decomposition costs.
 
 bf16 only, by design: this is the numeric the projection covers here, and the
 design/test box has no AMX-fp8.
@@ -391,7 +397,9 @@ def act_elems(groups, K: int) -> int:
 
 
 def make_batched_runner(groups, model, seed, copies: int = 1, acts=None):
-    """The projection's own decomposition: one batched GEMM pair per histogram bucket.
+    """Reference implementation of the bucket decomposition: one bmm pair per bucket.
+
+    This is the projection's SHAPE SET, not its cost model -- see the module docstring.
 
     `acts` is ONE activation buffer, shared by every group and (via time_cells) every
     cell of the leg. Groups run strictly in sequence and in the real block they all
@@ -488,8 +496,10 @@ def main() -> int:
     p.add_argument("--num-layers", type=int, default=DEFAULT_MODEL["num_layers"],
                    help='only used to expand --layer all')
     p.add_argument("--mode", choices=["fused", "batched", "both"], default="fused",
-                   help="fused = sglang fused_experts_cpu; batched = the projection's "
-                        "per-bucket batched GEMMs; both = run each and report the ratio")
+                   help="fused = sglang fused_experts_cpu; batched = a torch.bmm "
+                        "reference over the projection's per-bucket shapes (NOT the "
+                        "projection's cost -- see the module docstring); both = run "
+                        "each and report the ratio")
     archbench_stats.add_args(p)
     p.add_argument("--decode-csv", default=None, help="override the decode stats CSV "
                                                       "with a local file")
