@@ -61,8 +61,18 @@
 #                        much CPU (percent; 200 = 2 cores). Load average is not used
 #                        for the decision -- see the guard.
 #   AB="..."             extra stats-source flags, e.g. AB="--ab-offline"
-#   PY=python3           interpreter
-#   COOLDOWN=60          seconds of idle between cells, for the part to settle
+#   PY=python3           interpreter (used when IMG is empty)
+#   IMG=<image>          run each cell inside this container instead of on the metal.
+#                        The BKC is what serving actually runs, so a measured number is
+#                        only comparable to a published qwen35 KPI if it came from it.
+#   HOSTROOT=/home/farshad/moebench   mounted at /moebench in the container; OUT and
+#                        this script must live under it
+#   COPIES_RT=8          private weight sets per cell for the rt lanes, cycled so the
+#                        weights are read from DDR rather than out of the 320 MiB L3
+#                        slice an instance owns. rt decode reads only 12 MiB of a set.
+#   COPIES_THR=2         same for the thr lanes, which need far fewer: one iteration
+#                        there already reads 1.37 GiB of experts
+#   COOLDOWN=15          seconds of idle between cells, for the part to settle
 #   TEMP_MAX=80          do not start the next cell above this package temp (C)
 #   COOLDOWN_MAX=600     give up waiting to cool after this long, and say so
 #   FORCE=1              skip the busy/governor guards
@@ -80,8 +90,13 @@ LAYERS=${LAYERS:-all}
 MAXOTHER_CPU=${MAXOTHER_CPU:-200}
 AB=${AB:-}
 PY=${PY:-python3}
+IMG=${IMG:-}
+HOSTROOT=${HOSTROOT:-/home/farshad/moebench}
+COPIES_RT=${COPIES_RT:-8}
+COPIES_THR=${COPIES_THR:-2}
+COPIES=${COPIES:-$COPIES_RT}
 FORCE=${FORCE:-0}
-COOLDOWN=${COOLDOWN:-60}
+COOLDOWN=${COOLDOWN:-15}
 TEMP_MAX=${TEMP_MAX:-80}
 COOLDOWN_MAX=${COOLDOWN_MAX:-600}
 LANES=${LANES:-"35b_rt 35b_rt_unsharded 35b_thr 35b_shared_rt 35b_shared_thr"}
@@ -148,8 +163,11 @@ GOV_BEFORE=$(gov)
   echo "pkg temp now: $(pkgtemp)C   throttle: $(throttles)"
   echo "spread rt   : $SPREAD_RT   thr: $SPREAD_THR"
   echo "layers      : $LAYERS"
+  echo "copies      : $COPIES   (mix-layers on: one visit per layer per iteration)"
+  echo "runtime     : ${IMG:-bare metal $PY}"
+  echo "image id    : $([ -n "$IMG" ] && docker image inspect "$IMG" --format '{{.Id}}' 2>/dev/null || echo n/a)"
   echo "git         : $(git rev-parse HEAD 2>/dev/null || echo n/a)"
-  echo "torch       : $($PY -c 'import torch;print(torch.__version__)' 2>/dev/null || echo n/a)"
+  echo "torch       : $(runpy_version)"
 } | tee "$OUT/env_before.txt"
 
 # ---- guards -------------------------------------------------------------------
@@ -191,6 +209,37 @@ fi
 # The Python driver re-synchronises all instances on a barrier before EVERY iteration
 # and sets OMP_WAIT_POLICY=passive / KMP_BLOCKTIME=0 so idle threads sleep instead of
 # busy-waiting on cores their neighbours need. Measured imbalance after: ~1.07x median.
+# Host path -> the path the same file has inside the container ($HOSTROOT is mounted
+# at /moebench). A no-op when running on the metal.
+cpath() { [ -n "$IMG" ] && echo "${1/#$HOSTROOT//moebench}" || echo "$1"; }
+
+# One cell, on the metal or in the BKC container. The guards and thermal reads stay on
+# the HOST: /sys is what the host exposes, and `ps` inside a container cannot see the
+# other tenant the busy guard exists to catch.
+runpy() {
+  if [ -z "$IMG" ]; then
+    $PY bench_moe_cpu.py "$@"
+  else
+    docker run --rm --pid=host --user "$(id -u):$(id -g)" \
+      -v "$HOSTROOT:/moebench" -v "$HOME/.cache/moebench:/cache/moebench" \
+      -e HOME=/tmp -e MOEBENCH_CACHE=/cache/moebench/archbench \
+      -e LD_LIBRARY_PATH=/opt/conda/envs/sglang/lib \
+      -e MOEBENCH_WAIT_POLICY -e MOEBENCH_BLOCKTIME \
+      "$IMG" /opt/conda/envs/sglang/bin/python \
+      "$(cpath "$PWD")/bench_moe_cpu.py" "$@"
+  fi
+}
+
+runpy_version() {
+  if [ -z "$IMG" ]; then
+    $PY -c 'import torch;print(torch.__version__)' 2>/dev/null || echo n/a
+  else
+    docker run --rm -e LD_LIBRARY_PATH=/opt/conda/envs/sglang/lib "$IMG" \
+      /opt/conda/envs/sglang/bin/python -c 'import torch;print(torch.__version__)' \
+      2>/dev/null || echo n/a
+  fi
+}
+
 spread() {  # spread <name> <n_instances> <cores_per_instance> <args...>
   local name=$1 n=$2 cores=$3; shift 3
   echo
@@ -198,8 +247,8 @@ spread() {  # spread <name> <n_instances> <cores_per_instance> <args...>
   echo "$(date -Is) before=$name temp=$(pkgtemp)C throttle=$(throttles)" >> "$OUT/thermal.log"
   echo "  pre-cell: $(pkgtemp)C, throttle $(throttles)"
   # shellcheck disable=SC2086
-  $PY bench_moe_cpu.py "$@" --instances "$n" --cores-per-instance "$cores" $AB \
-      --out "$OUT/results.csv" 2>&1 | tee "$OUT/$name.log" \
+  runpy "$@" --instances "$n" --cores-per-instance "$cores" --copies "$COPIES" $AB \
+      --out "$(cpath "$OUT")/results.csv" 2>&1 | tee "$OUT/$name.log" \
     | grep -E "spread:|imbalance|^ +[0-9]+\.[0-9]+x|median imbalance|fused_experts_cpu:|batched GEMMs:|check:|REFUS|Error" || true
   echo "  post-cell: $(pkgtemp)C, throttle $(throttles)"
   cool_down "$name"
@@ -229,8 +278,10 @@ fi
 # bs320 prefill is the heaviest cell by far (~19.7 TFLOP/layer per instance, 392k
 # tokens fed, x4 concurrent) -- few iterations on purpose.
 if has 35b_thr; then
+  COPIES=$COPIES_THR \
   spread 35b_thr_decode  "$SPREAD_THR" "$CORES" --phase decode  --batch 320 \
       --layer "$LAYERS" --mode both --iters 10 --warmup 3
+  COPIES=1 \
   spread 35b_thr_prefill "$SPREAD_THR" "$CORES" --phase prefill --batch 320 \
       --layer "$LAYERS" --mode fused --iters 3 --warmup 1
 fi

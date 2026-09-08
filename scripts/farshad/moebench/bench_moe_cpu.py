@@ -262,35 +262,50 @@ class FusedExpertsCaller:
 # the two things we time
 # ---------------------------------------------------------------------------
 
-def time_it(fn, warmup: int, iters: int, barrier=None) -> Dict[str, float]:
-    """`barrier` re-syncs the concurrent instances before EVERY iteration.
+def time_mixed(runners, warmup: int, iters: int, barrier=None) -> List[Dict[str, float]]:
+    """Time several cells INTERLEAVED -- one visit to each, then round again.
 
-    Without it, instances that start together drift apart within a few
-    iterations, because per-layer work differs and nothing pulls them back. Once
-    drifted, an instance can be timed while its neighbours are between kernels
-    -- so it measures a partly-idle socket, which is the distortion the spread
-    exists to avoid. A per-iteration barrier makes every timed window contain
-    all instances, so any residual imbalance is real asymmetry rather than
-    scheduling luck.
+    Visiting every layer once per iteration is what sends a layer's weights back to
+    DDR: by the time the loop returns to a layer, the other layers have walked over
+    the whole cache hierarchy, which is exactly what a rank stepping through 40
+    layers does in production. Timing one cell to completion leaves its working set
+    resident instead -- 12 MiB of active experts at decode bs1, against the 320 MiB
+    L3 slice a 56-core instance owns -- and measures a cache-resident kernel.
+
+    `barrier` re-syncs the concurrent instances before EVERY call. Without it,
+    instances that start together drift apart within a few iterations (per-layer
+    work differs and nothing pulls them back) and one can then be timed while its
+    neighbours sit between kernels, measuring a partly-idle socket. With it, every
+    timed window holds all instances on the SAME cell.
     """
     def sync():
         if barrier is not None:
             barrier.wait()
 
     for _ in range(warmup):
-        sync()
-        fn()
-    samples = []
+        for fn in runners:
+            sync()
+            fn()
+    samples: List[List[float]] = [[] for _ in runners]
     for _ in range(iters):
-        sync()
-        t0 = time.perf_counter()
-        fn()
-        samples.append((time.perf_counter() - t0) * 1e3)
+        for i, fn in enumerate(runners):
+            sync()
+            t0 = time.perf_counter()
+            fn()
+            samples[i].append((time.perf_counter() - t0) * 1e3)
+    return [summarize_samples(s) for s in samples]
+
+
+def summarize_samples(samples: List[float]) -> Dict[str, float]:
     return dict(median_ms=statistics.median(samples),
                 min_ms=min(samples),
                 mean_ms=statistics.fmean(samples),
                 p90_ms=sorted(samples)[max(0, int(0.9 * len(samples)) - 1)],
                 iters=len(samples))
+
+
+def time_it(fn, warmup: int, iters: int, barrier=None) -> Dict[str, float]:
+    return time_mixed([fn], warmup, iters, barrier)[0]
 
 
 def fused_tensors(counts, num_tokens, model, caller, seed):
@@ -309,11 +324,28 @@ def fused_tensors(counts, num_tokens, model, caller, seed):
     return a, w1, w2, topk_weights, topk_ids
 
 
-def make_fused_runner(counts, num_tokens, model, caller, seed):
+def make_fused_runner(counts, num_tokens, model, caller, seed, copies: int = 1):
+    """Cycle the call over `copies` private prepacked weight sets.
+
+    The extra sets are clones, not fresh randoms: what has to differ between them is
+    the ADDRESS, not the values -- an AMX GEMM's cost does not depend on the bits it
+    multiplies, and a clone is one memcpy where a randn is a fp32 draw plus a cast.
+    The activations are deliberately shared: they are small and are cache-resident in
+    production too.
+    """
     a, w1, w2, topk_weights, topk_ids = fused_tensors(counts, num_tokens, model,
                                                       caller, seed)
-    pw1, pw2 = caller.prepack_weight(w1), caller.prepack_weight(w2)
-    return lambda: caller(a, pw1, pw2, topk_weights, topk_ids)
+    first = (caller.prepack_weight(w1), caller.prepack_weight(w2))
+    del w1, w2
+    sets = [first] + [(first[0].clone(), first[1].clone()) for _ in range(copies - 1)]
+    state = dict(i=0)
+
+    def run():
+        pw1, pw2 = sets[state["i"] % len(sets)]
+        state["i"] += 1
+        return caller(a, pw1, pw2, topk_weights, topk_ids)
+
+    return run
 
 
 def check_fused(counts, num_tokens, model, caller, seed, activation="silu"):
@@ -353,8 +385,13 @@ def check_fused(counts, num_tokens, model, caller, seed, activation="silu"):
     return err / scale, err
 
 
-def make_batched_runner(groups, model, seed):
-    """The projection's own decomposition: one batched GEMM pair per histogram bucket."""
+def make_batched_runner(groups, model, seed, copies: int = 1):
+    """The projection's own decomposition: one batched GEMM pair per histogram bucket.
+
+    Weights are cloned across `copies` so this leg streams from DDR on the same terms
+    as the fused one -- comparing a cache-resident bmm against a DDR-bound kernel
+    would attribute a memory-hierarchy difference to kernel quality.
+    """
     import torch
     import torch.nn.functional as F
     K, N = model["hidden_size"], model["moe_intermediate_size"]
@@ -365,12 +402,16 @@ def make_batched_runner(groups, model, seed):
         w1 = (torch.randn((nexp, K, 2 * N), generator=g, dtype=torch.float32) / 10).to(torch.bfloat16)
         w2 = (torch.randn((nexp, N, K), generator=g, dtype=torch.float32) / 10).to(torch.bfloat16)
         work.append((a, w1, w2))
+    sets = [work] + [[(a, w1.clone(), w2.clone()) for a, w1, w2 in work]
+                     for _ in range(copies - 1)]
+    state = dict(i=0)
 
     def run():
-        for a, w1, w2 in work:
+        for a, w1, w2 in sets[state["i"] % len(sets)]:
             h = torch.bmm(a, w1)
             gate, up = h.chunk(2, dim=-1)
             torch.bmm(F.silu(gate) * up, w2)
+        state["i"] += 1
 
     return run
 
@@ -467,6 +508,16 @@ def main() -> int:
                    help="dense FFN intermediate size; only used with --dense-ffn")
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--iters", type=int, default=10)
+    p.add_argument("--copies", type=int, default=1,
+                   help="private prepacked weight sets per cell, cycled one per call so "
+                        "the weights are read from DDR. One set's ACTIVE experts are only "
+                        "12 MiB at decode bs1 TP4, against the 320 MiB L3 slice a 56-core "
+                        "instance owns, so without copies that cell measures cache.")
+    p.add_argument("--no-mix-layers", dest="mix_layers", action="store_false",
+                   help="time each cell to completion instead of visiting every layer "
+                        "once per iteration. Interleaving is the default because it is "
+                        "what a rank walking 40 layers does, and it is what keeps a "
+                        "layer's weights out of cache between two visits.")
     p.add_argument("--threads", type=int, default=None, help="torch.set_num_threads")
     p.add_argument("--no-prepack", action="store_true",
                    help="skip convert_weight_packed (measures the non-VNNI path)")
@@ -682,99 +733,186 @@ def run_cells(args, model, model_key, barrier=None, tag_prefix="") -> List[Dict]
     print(f"model: model_key={model_key} K={K} N={N} E={E} topk={topk}  "
           f"phase={args.phase} stats_mode={args.expert_stats_mode} dtype={args.dtype}")
 
-    rows = []
+    cells = []
     for batch in args.batch:
         for layer in args.layer:
-            tag = f"{args.phase} bs{batch} L{layer}"
-            if args.dense_ffn:
-                # One "expert" seeing every token: decode routes 1 token/seq, prefill seq_len.
-                tokens = batch * (args.seq_len if args.phase == "prefill" else 1)
-                tag = f"{args.phase} bs{batch} dense"
-                hist = {tokens: 1}
+            cell = prepare_cell(args, model, model_key, batch, layer, csv_file,
+                                stats_commit, tag_prefix)
+            if cell is not None:
+                cells.append(cell)
+
+    if args.dry_run:
+        return [c["row"] for c in cells]
+    if args.check and args.mode in ("fused", "both"):
+        for cell in cells:
+            check_cell(args, model, caller, cell)
+    time_cells(args, model, caller, cells, barrier)
+    return [c["row"] for c in cells]
+
+
+def mem_available_bytes() -> int:
+    with open("/proc/meminfo") as f:
+        for line in f:
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+    return 0
+
+
+def pool_bytes(leg: str, cells: List[Dict], model, copies: int) -> int:
+    K, N, E = (model["hidden_size"], model["moe_intermediate_size"],
+               model["num_experts"])
+    if leg == "fused":
+        # Activations are not copied, but at thr prefill one cell's [num_tokens, K] is
+        # 1.6 GiB, so leaving them out of the estimate understates the pool by more
+        # than the weights of a whole extra copy.
+        weights = 2 * (E * 2 * N * K + E * K * N) * copies * len(cells)
+        return weights + sum(2 * c["num_tokens"] * K for c in cells)
+    total = 0
+    for c in cells:
+        weights = sum(nexp * (K * 2 * N + N * K) for nexp, _ in c["groups"])
+        acts = sum(nexp * tokens * K for nexp, tokens in c["groups"])
+        total += 2 * (weights * copies + acts)
+    return total
+
+
+def announce_pool(leg: str, cells: List[Dict], args, model) -> None:
+    """Print the weight pool this leg holds, and refuse a plan that cannot fit.
+
+    The pool is deliberately large -- it is what forces the weight traffic onto DDR --
+    so the guard matters: --copies multiplies it by the concurrent instances, and the
+    failure mode without a check is an OOM kill part-way through a cell.
+    """
+    gib = 1 << 30
+    instances = max(args.instances, 1)
+    need = pool_bytes(leg, cells, model, args.copies)
+    avail = mem_available_bytes()
+    if not args.instance_index:
+        print(f"\n{leg} weight pool: {need / gib:.1f} GiB per instance x {instances} "
+              f"= {need * instances / gib:.1f} GiB of {avail / gib:.1f} GiB available "
+              f"({len(cells)} cells x {args.copies} copies)")
+    if avail and need * instances > 0.7 * avail:
+        raise SystemExit(
+            f"{leg} pool needs {need * instances / gib:.1f} GiB across {instances} "
+            f"instances but only {avail / gib:.1f} GiB is available. Lower --copies "
+            f"or --layer, or run the legs as separate invocations.")
+
+
+def check_cell(args, model, caller, cell: Dict) -> None:
+    rel, absolute = check_fused(cell["counts"], cell["num_tokens"], model, caller,
+                                args.seed, args.activation)
+    cell["row"]["check_rel_err"] = rel
+    status = "OK" if rel <= args.check_rtol else "FAIL"
+    print(f"  {cell['label']} check: rel_err {rel:.3e} (abs {absolute:.3e}) vs fp32 "
+          f"reference -- {status}")
+    if rel > args.check_rtol:
+        raise SystemExit(f"{cell['tag']}: fused_experts_cpu disagrees with the fp32 "
+                         f"reference by {rel:.3e} > --check-rtol {args.check_rtol:g}; "
+                         f"timings from this build are not trustworthy.")
+
+
+def time_cells(args, model, caller, cells: List[Dict], barrier) -> None:
+    """Time the fused leg over every cell, then the batched leg over every cell.
+
+    The legs run as separate passes so only one leg's weight pool is resident: held
+    together they double the peak, which at TP1 over 40 layers times --copies decides
+    whether the pool fits in memory at all.
+    """
+    batches = [cells] if args.mix_layers else [[c] for c in cells]
+    for leg, make in (("fused", make_fused_runner), ("batched", make_batched_runner)):
+        if args.mode not in (leg, "both"):
+            continue
+        for group in batches:
+            announce_pool(leg, group, args, model)
+            t0 = time.perf_counter()
+            if leg == "fused":
+                runners = [make(c["counts"], c["num_tokens"], model, caller, args.seed,
+                                copies=args.copies) for c in group]
             else:
-                hist = moe_stats.read_histogram(csv_file, args.phase, batch, layer,
-                                                args.expert_stats_mode)
-            if hist is None:
-                print(f"\n{tag}: no stats rows -- skipped")
-                continue
-            R = routed_tokens(args.phase, batch, args.seq_len, topk)
-            try:
-                moe_stats.validate(hist, E, R, args.phase, where=tag)
-            except ValueError as exc:
-                if not args.skip_invalid:
-                    raise SystemExit(f"\n{exc}\n\n(pass --skip-invalid to measure it anyway)")
-                print(f"\n{tag}: INVALID STATS, measured anyway -- {exc}")
+                runners = [make(c["groups"], model, args.seed, copies=args.copies)
+                           for c in group]
+            if not args.instance_index:
+                print(f"  pool built in {time.perf_counter() - t0:.1f} s")
+            stats = time_mixed(runners, args.warmup, args.iters, barrier)
+            for c, r in zip(group, stats):
+                c["row"].update({f"{leg}_{k}": v for k, v in r.items()})
+            del runners
+    for cell in cells:
+        report_cell(cell)
 
-            groups = moe_stats.groups(hist)
-            counts, num_tokens, slack = moe_stats.expert_token_counts(hist, E, topk)
-            mass = moe_stats.histogram_mass(hist)
-            active = sum(hist.values())
-            # 2 flops/MAC; gate+up is K x 2N and down is N x K per routed slot.
-            flops = 6.0 * (mass + slack) * K * N
 
-            print(f"\n{tag_prefix}{tag}")
-            print(f"  histogram: {len(groups)} groups, {active}/{E} experts active, "
-                  f"mass {mass} slots (routed_tokens {R}, {(mass - R) / R:+.1%})")
-            print(f"  tokens fed: {num_tokens}"
-                  + (f"  (+{slack} slack slots for topk divisibility)" if slack else ""))
-            for nexp, tokens in groups:
-                print(f"    group: {nexp:4d} experts x {tokens:6d} tokens  -> bmm "
-                      f"[{nexp},{tokens},{K}]x[{nexp},{K},{2 * N}] + "
-                      f"[{nexp},{tokens},{N}]x[{nexp},{N},{K}]")
-            print(f"  work: {flops / 1e9:.2f} GFLOP")
+def report_cell(cell: Dict) -> None:
+    row, flops = cell["row"], cell["flops"]
+    print(f"\n{cell['label']}")
+    for leg, label in (("fused", "fused_experts_cpu:"), ("batched", "batched GEMMs:    ")):
+        med = row.get(f"{leg}_median_ms")
+        if med is None:
+            continue
+        print(f"  {label} {med:.3f} ms median (min {row[f'{leg}_min_ms']:.3f}, "
+              f"p90 {row[f'{leg}_p90_ms']:.3f})  {flops / 1e9 / (med / 1e3):.1f} GFLOP/s")
+    if row.get("fused_median_ms") and row.get("batched_median_ms"):
+        ratio = row["fused_median_ms"] / row["batched_median_ms"]
+        row["fused_over_batched"] = ratio
+        print(f"  fused / batched:   {ratio:.2f}x "
+              f"({'fused wins' if ratio < 1 else 'batched wins'})")
 
-            row = dict(phase=args.phase, batch=batch, layer=layer,
-                       instance=args.instance_index,
-                       stats_commit=stats_commit,
-                       stats_ref=args.ab_ref if stats_commit else "",
-                       dtype=args.dtype,
-                       stats_mode=args.expert_stats_mode, hidden_size=K,
-                       moe_intermediate_size=N, num_experts=E, topk=topk,
-                       tp=args.tp, threads=args.threads or 0,
-                       num_groups=len(groups), active_experts=active,
-                       histogram_mass=mass, routed_tokens=R, slack=slack,
-                       num_tokens=num_tokens, gflop=flops / 1e9,
-                       groups=";".join(f"{n}x{t}" for n, t in groups))
 
-            if args.dry_run:
-                rows.append(row)
-                continue
+def prepare_cell(args, model, model_key, batch: int, layer: int, csv_file: str,
+                 stats_commit: str, tag_prefix: str) -> Optional[Dict]:
+    """Read one cell's histogram, print its decomposition, and build its result row."""
+    K, N, E, topk = (model["hidden_size"], model["moe_intermediate_size"],
+                     model["num_experts"], model["topk"])
+    tag = f"{args.phase} bs{batch} L{layer}"
+    if args.dense_ffn:
+        # One "expert" seeing every token: decode routes 1 token/seq, prefill seq_len.
+        tokens = batch * (args.seq_len if args.phase == "prefill" else 1)
+        tag = f"{args.phase} bs{batch} dense"
+        hist = {tokens: 1}
+    else:
+        hist = moe_stats.read_histogram(csv_file, args.phase, batch, layer,
+                                        args.expert_stats_mode)
+    if hist is None:
+        print(f"\n{tag}: no stats rows -- skipped")
+        return None
+    R = routed_tokens(args.phase, batch, args.seq_len, topk)
+    try:
+        moe_stats.validate(hist, E, R, args.phase, where=tag)
+    except ValueError as exc:
+        if not args.skip_invalid:
+            raise SystemExit(f"\n{exc}\n\n(pass --skip-invalid to measure it anyway)")
+        print(f"\n{tag}: INVALID STATS, measured anyway -- {exc}")
 
-            if args.check and args.mode in ("fused", "both"):
-                rel, absolute = check_fused(counts, num_tokens, model, caller,
-                                            args.seed, args.activation)
-                row["check_rel_err"] = rel
-                status = "OK" if rel <= args.check_rtol else "FAIL"
-                print(f"  check: rel_err {rel:.3e} (abs {absolute:.3e}) vs fp32 "
-                      f"reference -- {status}")
-                if rel > args.check_rtol:
-                    raise SystemExit(f"{tag}: fused_experts_cpu disagrees with the fp32 "
-                                     f"reference by {rel:.3e} > --check-rtol "
-                                     f"{args.check_rtol:g}; timings from this build are "
-                                     f"not trustworthy.")
+    groups = moe_stats.groups(hist)
+    counts, num_tokens, slack = moe_stats.expert_token_counts(hist, E, topk)
+    mass = moe_stats.histogram_mass(hist)
+    active = sum(hist.values())
+    # 2 flops/MAC; gate+up is K x 2N and down is N x K per routed slot.
+    flops = 6.0 * (mass + slack) * K * N
 
-            if args.mode in ("fused", "both"):
-                r = time_it(make_fused_runner(counts, num_tokens, model, caller, args.seed),
-                            args.warmup, args.iters, barrier)
-                row.update({f"fused_{k}": v for k, v in r.items()})
-                print(f"  fused_experts_cpu: {r['median_ms']:.3f} ms median "
-                      f"(min {r['min_ms']:.3f}, p90 {r['p90_ms']:.3f})  "
-                      f"{flops / 1e9 / (r['median_ms'] / 1e3):.1f} GFLOP/s")
-            if args.mode in ("batched", "both"):
-                r = time_it(make_batched_runner(groups, model, args.seed),
-                            args.warmup, args.iters, barrier)
-                row.update({f"batched_{k}": v for k, v in r.items()})
-                print(f"  batched GEMMs:     {r['median_ms']:.3f} ms median "
-                      f"(min {r['min_ms']:.3f}, p90 {r['p90_ms']:.3f})  "
-                      f"{flops / 1e9 / (r['median_ms'] / 1e3):.1f} GFLOP/s")
-            if args.mode == "both":
-                ratio = row["fused_median_ms"] / row["batched_median_ms"]
-                row["fused_over_batched"] = ratio
-                print(f"  fused / batched:   {ratio:.2f}x "
-                      f"({'fused wins' if ratio < 1 else 'batched wins'})")
-            rows.append(row)
+    print(f"\n{tag_prefix}{tag}")
+    print(f"  histogram: {len(groups)} groups, {active}/{E} experts active, "
+          f"mass {mass} slots (routed_tokens {R}, {(mass - R) / R:+.1%})")
+    print(f"  tokens fed: {num_tokens}"
+          + (f"  (+{slack} slack slots for topk divisibility)" if slack else ""))
+    for nexp, tokens in groups:
+        print(f"    group: {nexp:4d} experts x {tokens:6d} tokens  -> bmm "
+              f"[{nexp},{tokens},{K}]x[{nexp},{K},{2 * N}] + "
+              f"[{nexp},{tokens},{N}]x[{nexp},{N},{K}]")
+    print(f"  work: {flops / 1e9:.2f} GFLOP")
 
-    return rows
+    row = dict(phase=args.phase, batch=batch, layer=layer,
+               instance=args.instance_index,
+               stats_commit=stats_commit,
+               stats_ref=args.ab_ref if stats_commit else "",
+               dtype=args.dtype,
+               stats_mode=args.expert_stats_mode, hidden_size=K,
+               moe_intermediate_size=N, num_experts=E, topk=topk,
+               tp=args.tp, threads=args.threads or 0,
+               num_groups=len(groups), active_experts=active,
+               histogram_mass=mass, routed_tokens=R, slack=slack,
+               num_tokens=num_tokens, gflop=flops / 1e9,
+               groups=";".join(f"{n}x{t}" for n, t in groups))
+    return dict(tag=tag, label=f"{tag_prefix}{tag}", row=row, counts=counts,
+                num_tokens=num_tokens, groups=groups, flops=flops)
 
 
 # Every column the results CSV can carry, in a FIXED order.
