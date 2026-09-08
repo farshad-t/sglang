@@ -146,6 +146,37 @@ cool_down() {
 }
 epp() { cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference 2>/dev/null || echo unknown; }
 
+# Host path -> the path the same file has inside the container ($HOSTROOT is mounted
+# at /moebench). A no-op when running on the metal.
+cpath() { [ -n "$IMG" ] && echo "${1/#$HOSTROOT//moebench}" || echo "$1"; }
+
+# One cell, on the metal or in the BKC container. The guards and thermal reads stay on
+# the HOST: /sys is what the host exposes, and `ps` inside a container cannot see the
+# other tenant the busy guard exists to catch.
+runpy() {
+  if [ -z "$IMG" ]; then
+    $PY bench_moe_cpu.py "$@"
+  else
+    docker run --rm --pid=host --user "$(id -u):$(id -g)" \
+      -v "$HOSTROOT:/moebench" -v "$HOME/.cache/moebench:/cache/moebench" \
+      -e HOME=/tmp -e MOEBENCH_CACHE=/cache/moebench/archbench \
+      -e LD_LIBRARY_PATH=/opt/conda/envs/sglang/lib \
+      -e MOEBENCH_WAIT_POLICY -e MOEBENCH_BLOCKTIME \
+      "$IMG" /opt/conda/envs/sglang/bin/python \
+      "$(cpath "$PWD")/bench_moe_cpu.py" "$@"
+  fi
+}
+
+runpy_version() {
+  if [ -z "$IMG" ]; then
+    $PY -c 'import torch;print(torch.__version__)' 2>/dev/null || echo n/a
+  else
+    docker run --rm -e LD_LIBRARY_PATH=/opt/conda/envs/sglang/lib "$IMG" \
+      /opt/conda/envs/sglang/bin/python -c 'import torch;print(torch.__version__)' \
+      2>/dev/null || echo n/a
+  fi
+}
+
 GOV_BEFORE=$(gov)
 {
   echo "host        : $(hostname)"
@@ -209,37 +240,6 @@ fi
 # The Python driver re-synchronises all instances on a barrier before EVERY iteration
 # and sets OMP_WAIT_POLICY=passive / KMP_BLOCKTIME=0 so idle threads sleep instead of
 # busy-waiting on cores their neighbours need. Measured imbalance after: ~1.07x median.
-# Host path -> the path the same file has inside the container ($HOSTROOT is mounted
-# at /moebench). A no-op when running on the metal.
-cpath() { [ -n "$IMG" ] && echo "${1/#$HOSTROOT//moebench}" || echo "$1"; }
-
-# One cell, on the metal or in the BKC container. The guards and thermal reads stay on
-# the HOST: /sys is what the host exposes, and `ps` inside a container cannot see the
-# other tenant the busy guard exists to catch.
-runpy() {
-  if [ -z "$IMG" ]; then
-    $PY bench_moe_cpu.py "$@"
-  else
-    docker run --rm --pid=host --user "$(id -u):$(id -g)" \
-      -v "$HOSTROOT:/moebench" -v "$HOME/.cache/moebench:/cache/moebench" \
-      -e HOME=/tmp -e MOEBENCH_CACHE=/cache/moebench/archbench \
-      -e LD_LIBRARY_PATH=/opt/conda/envs/sglang/lib \
-      -e MOEBENCH_WAIT_POLICY -e MOEBENCH_BLOCKTIME \
-      "$IMG" /opt/conda/envs/sglang/bin/python \
-      "$(cpath "$PWD")/bench_moe_cpu.py" "$@"
-  fi
-}
-
-runpy_version() {
-  if [ -z "$IMG" ]; then
-    $PY -c 'import torch;print(torch.__version__)' 2>/dev/null || echo n/a
-  else
-    docker run --rm -e LD_LIBRARY_PATH=/opt/conda/envs/sglang/lib "$IMG" \
-      /opt/conda/envs/sglang/bin/python -c 'import torch;print(torch.__version__)' \
-      2>/dev/null || echo n/a
-  fi
-}
-
 spread() {  # spread <name> <n_instances> <cores_per_instance> <args...>
   local name=$1 n=$2 cores=$3; shift 3
   echo
