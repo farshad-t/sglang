@@ -184,6 +184,15 @@ class FusedExpertsCaller:
         self.activation = activation
 
         self.kind = None
+        # TORCH_LIBRARY registration runs at `import sgl_kernel`, so probing
+        # torch.ops first reports "absent" on a build that has the op: in the
+        # qwen35-bkc container that sent us down the pybind path, which that build
+        # does not have either. Import before looking, tolerate a build with no
+        # importable package (the pybind branch reports it properly).
+        try:
+            import sgl_kernel  # noqa: F401
+        except Exception:
+            pass
         op = getattr(getattr(torch.ops, "sgl_kernel", None), "fused_experts_cpu", None)
         if op is not None:
             self.kind = "torch.ops"
