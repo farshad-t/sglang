@@ -51,7 +51,23 @@ def load(dirs: List[str]) -> List[Dict[str, str]]:
         for path in sorted(glob.glob(os.path.join(d, "results.inst*.csv"))):
             inst = os.path.basename(path).split("inst")[1].split(".")[0]
             with open(path) as f:
-                for r in csv.DictReader(f):
+                reader = csv.DictReader(f)
+                for i, r in enumerate(reader, start=2):
+                    # A row with fewer cells than the header means every value after
+                    # the gap sits under the WRONG label -- csv.DictReader fills the
+                    # tail with None. Runs before write_rows pinned RESULT_FIELDS did
+                    # this whenever a --check lane opened the file and a later lane
+                    # without --check appended to it, which read back a fused_median_ms
+                    # in milliseconds as a `check_rel_err` of 3.295. Refuse the file
+                    # rather than merge shifted columns.
+                    short = [k for k, v in r.items() if v is None]
+                    if short or None in r:
+                        raise SystemExit(
+                            f"{path}:{i} has {len(reader.fieldnames) - len(short)} of "
+                            f"{len(reader.fieldnames)} columns ({short} empty): the row "
+                            f"is column-SHIFTED against the header, so its values are "
+                            f"mislabelled. Re-run this lane with a harness that writes "
+                            f"RESULT_FIELDS.")
                     r["run"] = run
                     r["instance"] = inst
                     r["lane"] = lane_of(r)

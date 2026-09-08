@@ -316,10 +316,14 @@ def check_fused(counts, num_tokens, model, caller, seed, activation="silu"):
     import torch.nn.functional as F
     a, w1, w2, topk_weights, topk_ids = fused_tensors(counts, num_tokens, model,
                                                       caller, seed)
+    # Snapshot the activations BEFORE the call. With --inplace the kernel writes its
+    # output into `a` and hands the same storage back, so an `a.float()` taken
+    # afterwards would build the reference out of the kernel's own output and the
+    # check would grade the kernel against itself.
+    af = a.float()
     got = caller(a, caller.prepack_weight(w1), caller.prepack_weight(w2),
                  topk_weights, topk_ids).to(torch.float32)
 
-    af = a.float()
     ref = torch.zeros_like(af)
     N = model["moe_intermediate_size"]
     # Upcast one expert's weights at a time: the whole stack in fp32 would be ~3 GB
@@ -540,12 +544,13 @@ def _instance_main(idx: int, cores: List[int], barrier, queue, args, model, mode
     os.environ["OMP_NUM_THREADS"] = str(len(cores))
     os.environ["OMP_PROC_BIND"] = "close"
     os.environ["OMP_PLACES"] = "cores"
-    # Idle OpenMP threads busy-wait by default (libgomp OMP_WAIT_POLICY, libiomp
-    # KMP_BLOCKTIME=200ms). With 4 x 56 threads that means an instance between
-    # kernels burns its cores at 100%, stealing frequency headroom from the others
-    # and making the groups diverge. Passive/0 puts them to sleep instead.
-    os.environ["OMP_WAIT_POLICY"] = "passive"
-    os.environ["KMP_BLOCKTIME"] = "0"
+    # Sleeping idle OpenMP threads (passive / KMP_BLOCKTIME=0) costs a wake-up on
+    # every kernel call: measured on X4PT, decode bs1 TP4 went 0.093 ms busy-wait ->
+    # 5.0 ms passive, 54x, for 0.0126 GFLOP of work. The per-iteration barrier already
+    # keeps the instances in step, so their idle windows are short and aligned and
+    # busy-waiting does not steal a neighbour's frequency. Overridable to re-measure.
+    os.environ["OMP_WAIT_POLICY"] = os.environ.get("MOEBENCH_WAIT_POLICY", "active")
+    os.environ["KMP_BLOCKTIME"] = os.environ.get("MOEBENCH_BLOCKTIME", "200")
     # KMP_AFFINITY would override OMP_PLACES/OMP_PROC_BIND and uses absolute proc
     # ids, which mis-place under a restricted affinity mask.
     os.environ.pop("KMP_AFFINITY", None)
@@ -763,20 +768,65 @@ def run_cells(args, model, model_key, barrier=None, tag_prefix="") -> List[Dict]
     return rows
 
 
+# Every column the results CSV can carry, in a FIXED order.
+#
+# The header MUST NOT be derived from the rows one invocation happens to produce.
+# A lane sweep appends several invocations to the SAME --out file, and they do not
+# all fill the same columns: `check_rel_err` only exists under --check, and the
+# batched_* / fused_over_batched columns only under --mode batched/both. The first
+# invocation writes the header; a later one whose rows lack an earlier column used
+# to shift every following value one cell to the LEFT, silently, under a header that
+# still said otherwise. That is how a 3.295 ms `fused_median_ms` was read back as a
+# check_rel_err of 3.295 (i.e. "330% error") for the lanes that never ran --check at
+# all -- the kernel and the fp32 reference were both fine. Fixed order + restval ""
+# keeps every value under its own label whatever a given cell measured.
+RESULT_FIELDS: List[str] = [
+    "phase", "batch", "layer", "instance",
+    "stats_commit", "stats_ref", "dtype", "stats_mode",
+    "hidden_size", "moe_intermediate_size", "num_experts", "topk", "tp", "threads",
+    "num_groups", "active_experts", "histogram_mass", "routed_tokens", "slack",
+    "num_tokens", "gflop", "groups",
+    "check_rel_err",
+    "fused_median_ms", "fused_min_ms", "fused_mean_ms", "fused_p90_ms", "fused_iters",
+    "batched_median_ms", "batched_min_ms", "batched_mean_ms", "batched_p90_ms",
+    "batched_iters",
+    "fused_over_batched",
+]
+
+
 def write_rows(args, rows: List[Dict]) -> None:
-    if args.out and rows:
-        fields: List[str] = []
-        for r in rows:
-            for k in r:
-                if k not in fields:
-                    fields.append(k)
-        new = not os.path.exists(args.out)
-        with open(args.out, "a", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=fields)
-            if new:
-                w.writeheader()
-            w.writerows(rows)
-        print(f"\nwrote {len(rows)} rows to {args.out}")
+    if not (args.out and rows):
+        return
+    keys = {k for r in rows for k in r}
+    unknown = sorted(keys - set(RESULT_FIELDS))
+    if unknown:
+        raise SystemExit(f"write_rows: new result column(s) {unknown} are not in "
+                         f"RESULT_FIELDS. Add them there (at the END, so old CSVs stay "
+                         f"readable) rather than letting the header float.")
+
+    # Honour a header already on disk -- including one written by an older revision
+    # with fewer columns -- and refuse to append rows it cannot represent, instead of
+    # writing values into the wrong columns.
+    fields = RESULT_FIELDS
+    new = not os.path.exists(args.out)
+    if not new:
+        with open(args.out, newline="") as f:
+            existing = next(csv.reader(f), None)
+        if existing:
+            missing = sorted(keys - set(existing))
+            if missing:
+                raise SystemExit(
+                    f"write_rows: {args.out} was opened with a header that has no "
+                    f"{missing} column(s), so these rows cannot be appended without "
+                    f"shifting the ones already there. Write to a fresh --out file.")
+            fields = existing
+
+    with open(args.out, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields, restval="")
+        if new:
+            w.writeheader()
+        w.writerows(rows)
+    print(f"\nwrote {len(rows)} rows to {args.out}")
 
 
 if __name__ == "__main__":
