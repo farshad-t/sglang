@@ -161,7 +161,13 @@ class StatsSource:
                 f"cache root: {CACHE_ROOT}")
         blob = self.read(repo_path)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
-        tmp = dst + ".tmp"
+        # PER-PROCESS temp name. `--instances N` spawns N children that each call
+        # resolve_csv, so on a cold cache they all materialize the same repo_path at
+        # once. A shared "<dst>.tmp" lets one child truncate the file another is still
+        # writing, and the winning os.replace then publishes a TRUNCATED csv that
+        # os.path.exists() caches forever. A short prefill file whose reduced mass
+        # still lands inside the +/-20% band measures silently less work.
+        tmp = "{}.tmp.{}".format(dst, os.getpid())
         with open(tmp, "wb") as f:
             f.write(blob)
         os.replace(tmp, dst)  # atomic, so a killed run cannot leave a half file

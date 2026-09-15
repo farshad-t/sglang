@@ -2,8 +2,10 @@
 """Merge the per-instance CSVs from one or more run directories into one tidy table,
 plus a per-cell summary.
 
-Each lane writes `results.inst<N>.csv` per concurrent instance, so a single cell
-appears once per instance. Two things are worth separating there:
+`bench_moe_cpu.py --instances N` collects every instance's rows in the parent and
+writes ONE file, with an `instance` column, so a single cell appears once per
+instance inside that file. (Runs made before the concurrency moved into the driver
+wrote `results.inst<N>.csv` per instance; both layouts are read.) Two things are worth separating there:
 
   * the SPREAD across instances tells you whether the four 56-core groups are
     actually equivalent on this part -- if one group is consistently slower, the
@@ -31,6 +33,8 @@ def lane_of(row: Dict[str, str]) -> str:
     record it, but the lane is fully determined by the shape it ran."""
     if row.get("label"):
         return row["label"]
+    # No label (pre---label runs): fall back to the shape, which CANNOT separate a
+    # 1x224c contrast lane from a 4x56c replica lane -- both are tp1/bs320.
     K = int(row["hidden_size"])
     E = int(row["num_experts"])
     tp = int(row.get("tp") or 1)
@@ -39,6 +43,10 @@ def lane_of(row: Dict[str, str]) -> str:
         base = "9b_dense" if K == 4096 else "35b_shared"
         return f"{base}_{'rt' if batch in (1,) else 'thr'}"
     if batch == 1:
+        # `35b_rt_unsharded` is no longer a lane -- realtime is TP4 only. The name is
+        # kept ONLY so the run directories already on disk (which predate --label and do
+        # contain tp1/bs1 rows) still resolve to what they actually were. New runs carry
+        # a real --label and never reach this branch.
         return "35b_rt" if tp > 1 else "35b_rt_unsharded"
     return "35b_thr" if tp == 1 else f"35b_thr_tp{tp}"
 
@@ -48,8 +56,12 @@ def load(dirs: List[str]) -> List[Dict[str, str]]:
     for d in dirs:
         d = d.rstrip("/")
         run = os.path.basename(d)
-        for path in sorted(glob.glob(os.path.join(d, "results.inst*.csv"))):
-            inst = os.path.basename(path).split("inst")[1].split(".")[0]
+        # results.csv is what the driver writes today; results.inst<N>.csv is the
+        # pre-`--instances` layout. Globbing only the latter matched nothing at all,
+        # so the aggregator hard-exited on every current run.
+        for path in sorted(glob.glob(os.path.join(d, "results*.csv"))):
+            base = os.path.basename(path)
+            file_inst = base.split("inst")[1].split(".")[0] if "inst" in base else None
             with open(path) as f:
                 reader = csv.DictReader(f)
                 for i, r in enumerate(reader, start=2):
@@ -69,7 +81,9 @@ def load(dirs: List[str]) -> List[Dict[str, str]]:
                             f"mislabelled. Re-run this lane with a harness that writes "
                             f"RESULT_FIELDS.")
                     r["run"] = run
-                    r["instance"] = inst
+                    # Prefer the column the driver writes; fall back to the filename
+                    # for the old per-instance layout.
+                    r["instance"] = r.get("instance") or file_inst or "0"
                     r["lane"] = lane_of(r)
                     rows.append(r)
     return rows
@@ -86,13 +100,13 @@ def fnum(row, key):
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("dirs", nargs="+", help="run directories containing results.inst*.csv")
+    p.add_argument("dirs", nargs="+", help="run directories containing results*.csv")
     p.add_argument("--out-dir", default=".")
     args = p.parse_args()
 
     rows = load(args.dirs)
     if not rows:
-        raise SystemExit(f"no results.inst*.csv found under {args.dirs}")
+        raise SystemExit(f"no results*.csv found under {args.dirs}")
 
     # ---- tidy merge -----------------------------------------------------------
     fields = ["run", "lane", "instance"]
@@ -158,13 +172,17 @@ def main() -> int:
     # ---- lane-level roll-up, printed ------------------------------------------
     print(f"{len(rows)} rows -> {merged}")
     print(f"{len(out)} cells -> {summary}\n")
-    hdr = (f"{'lane':<20} {'phase':<8} {'bs':>4} {'tp':>2} {'lay':>4} {'GFLOP':>9} "
+    hdr = (f"{'run':<24} {'lane':<20} {'phase':<8} {'bs':>4} {'tp':>2} {'lay':>4} {'GFLOP':>9} "
            f"{'fused_max':>10} {'batch_max':>10} {'f/b':>6} {'spread':>6}")
     print(hdr); print("-" * len(hdr))
     by_lane: Dict[tuple, List[Dict]] = {}
     for r in out:
-        by_lane.setdefault((r["lane"], r["phase"], r["batch"], r["tp"]), []).append(r)
-    for (lane, phase, batch, tp), rs in sorted(by_lane.items()):
+        # `run` MUST be in the key: without it two run directories (the documented
+        # `dmr_results/*/` invocation) sum into one row, doubling `lay`, GFLOP and the
+        # layer-summed milliseconds under a footnote that says "summed over the layers".
+        by_lane.setdefault((r["run"], r["lane"], r["phase"], r["batch"], r["tp"]),
+                           []).append(r)
+    for (run, lane, phase, batch, tp), rs in sorted(by_lane.items()):
         # Per-layer cells collapse to the layer-summed cost, which is what a whole
         # model pass pays; single-cell lanes (dense) just report themselves.
         fm = sum(r.get("fused_max_ms") or 0 for r in rs)
@@ -172,7 +190,7 @@ def main() -> int:
         gf = sum(float(r["gflop"]) for r in rs)
         sp = max((r.get("fused_spread") or 1) for r in rs)
         nl = len(rs)
-        print(f"{lane:<20} {phase:<8} {batch:>4} {tp:>2} {nl:>4} {gf:>9.1f} "
+        print(f"{run:<24} {lane:<20} {phase:<8} {batch:>4} {tp:>2} {nl:>4} {gf:>9.1f} "
               f"{fm:>10.3f} {bm if bm else float('nan'):>10.3f} "
               f"{(fm/bm if bm else float('nan')):>6.2f} {sp:>6.2f}")
     print("\nfused_max/batch_max are summed over the layers measured (`lay`), using the "

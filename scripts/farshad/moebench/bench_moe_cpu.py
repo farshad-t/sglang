@@ -24,9 +24,10 @@ The batched leg carries the projection's SHAPE SET and NOT its cost model, so a
 fused/batched ratio is not projection error. archbench charges ideal_ops divided by
 a measured efficiency, and those eff sources (kfw-onednn + bdnn_silic) hold benchdnn
 oneDNN runs of these exact bucket shapes: summed over the 27 buckets of the qwen35
-thr-decode cell they come to 6.23 ms against a measured fused 6.36 ms, 1.02x, while
-this leg's torch.bmm takes 68 ms. That 10.7x is PyTorch per-call overhead at tiny M
-(2-159 tokens per expert over 54 bmm calls, 8% of DDR peak and 0.2% of AMX peak) --
+thr-decode cell at LAYER 0 they come to 6.23 ms against a measured fused 6.36 ms,
+1.02x, while this leg's torch.bmm takes 68 ms. That 10.7x is PyTorch per-call overhead
+at tiny M -- 1..159 tokens per expert over 54 bmm calls, 8% of DDR peak and 0.2% of AMX
+peak. (Other layers of the same cell run 26-36 buckets, so the call count varies.)
 bf16 bmm does dispatch to oneDNN AMX brgemm, so it is not an ISA difference. Compare
 a fused measurement against the eff-source row or a projection result dir; use this
 leg only to say what an unoptimised decomposition costs.
@@ -205,7 +206,10 @@ class FusedExpertsCaller:
             self.op = op
             self.schema = op.default._schema
             self.arg_names = [x.name for x in self.schema.arguments]
-            self.pack = torch.ops.sgl_kernel.convert_weight_packed
+            # getattr, not attribute access: a missing op RAISES AttributeError
+            # rather than returning None, which made the `is None` guard below
+            # unreachable and left --no-prepack unable to rescue such a build.
+            self.pack = getattr(torch.ops.sgl_kernel, "convert_weight_packed", None)
         else:
             import inspect
             try:
@@ -221,7 +225,7 @@ class FusedExpertsCaller:
             self.op = sk_cpu.fused_experts
             self.schema = inspect.signature(self.op)
             self.arg_names = list(self.schema.parameters)
-            self.pack = sgl_kernel.common_ops.convert_weight_packed
+            self.pack = getattr(sgl_kernel.common_ops, "convert_weight_packed", None)
         if prepack and self.pack is None:
             raise RuntimeError("prepacking requested but convert_weight_packed is not "
                                "available in this build (pass --no-prepack)")
@@ -314,12 +318,20 @@ def time_it(fn, warmup: int, iters: int, barrier=None) -> Dict[str, float]:
     return time_mixed([fn], warmup, iters, barrier)[0]
 
 
-def fused_tensors(counts, num_tokens, model, caller, seed):
+def fused_tensors(counts, num_tokens, model, caller, seed, acts=None):
+    """`acts`, when given, is ONE activation buffer shared across the cells of a leg --
+    each cell takes a contiguous [num_tokens, K] PREFIX view of it. See
+    make_fused_runner. Left None (the default, and what check_fused uses) each cell
+    draws its own, so the numeric check is unaffected by the sharing."""
     import torch
     K, N, E, topk = (model["hidden_size"], model["moe_intermediate_size"],
                      model["num_experts"], model["topk"])
     g = torch.Generator().manual_seed(seed)
-    a = (torch.randn((num_tokens, K), generator=g, dtype=torch.float32) / 10).to(torch.bfloat16)
+    if acts is None:
+        a = (torch.randn((num_tokens, K), generator=g,
+                         dtype=torch.float32) / 10).to(torch.bfloat16)
+    else:
+        a = acts[:num_tokens * K].view(num_tokens, K)
     w1 = (torch.randn((E, 2 * N, K), generator=g, dtype=torch.float32) / 10).to(torch.bfloat16)
     w2 = (torch.randn((E, K, N), generator=g, dtype=torch.float32) / 10).to(torch.bfloat16)
     topk_ids = build_topk_ids(counts, num_tokens, topk)
@@ -330,17 +342,27 @@ def fused_tensors(counts, num_tokens, model, caller, seed):
     return a, w1, w2, topk_weights, topk_ids
 
 
-def make_fused_runner(counts, num_tokens, model, caller, seed, copies: int = 1):
+def make_fused_runner(counts, num_tokens, model, caller, seed, copies: int = 1,
+                      acts=None):
     """Cycle the call over `copies` private prepacked weight sets.
 
     The extra sets are clones, not fresh randoms: what has to differ between them is
     the ADDRESS, not the values -- an AMX GEMM's cost does not depend on the bits it
     multiplies, and a clone is one memcpy where a randn is a fp32 draw plus a cast.
-    The activations are deliberately shared: they are small and are cache-resident in
-    production too.
+
+    `acts` is ONE activation buffer shared by every cell of the leg, exactly as the
+    batched leg already shares one (make_batched_runner). Without it each cell held its
+    own [num_tokens, K]: at thr prefill that is 1.5 GiB x 40 layers = 60 GiB, half the
+    fused pool, and it made the FUSED leg 1.85x the batched one -- so the leg that has
+    to fit was the one that did not. Every cell of a layer sweep routes within ~2% of
+    the same token count, and a real rank re-reads one activation buffer at every layer,
+    so one buffer sized to the largest cell is the faithful shape as well as the cheap
+    one. NOTE this makes the fused leg's ACTIVATION reads cache-resident across cells,
+    the same way the batched leg's already are -- the weights, which is what --copies
+    exists to push onto DDR, are untouched.
     """
     a, w1, w2, topk_weights, topk_ids = fused_tensors(counts, num_tokens, model,
-                                                      caller, seed)
+                                                      caller, seed, acts=acts)
     first = (caller.prepack_weight(w1), caller.prepack_weight(w2))
     del w1, w2
     sets = [first] + [(first[0].clone(), first[1].clone()) for _ in range(copies - 1)]
@@ -420,8 +442,8 @@ def make_batched_runner(groups, model, seed, copies: int = 1, acts=None):
     K, N = model["hidden_size"], model["moe_intermediate_size"]
     g = torch.Generator().manual_seed(seed)
     if acts is None:
-        acts = (torch.randn(act_elems(groups, K), generator=g,
-                            dtype=torch.float32) / 10).to(torch.bfloat16)
+        acts = torch.randn(act_elems(groups, K), generator=g,
+                           dtype=torch.bfloat16) / 10
     work = []
     for nexp, tokens in groups:
         w1 = (torch.randn((nexp, K, 2 * N), generator=g, dtype=torch.float32) / 10).to(torch.bfloat16)
@@ -523,10 +545,15 @@ def main() -> int:
                    help="tensor-parallel size to shard moe_intermediate_size by, i.e. what "
                         "ONE rank executes (N -> N/tp, all E experts kept). The expert "
                         "stats are still looked up under the unsharded model key, since "
-                        "routing does not depend on the split. Note archbench's own "
-                        "Qwen3_5MoeExperts does NOT shard the MoE, so --tp 1 is what the "
-                        "projection charges per rank and --tp 4 is what a real sglang TP4 "
-                        "rank runs.")
+                        "routing does not depend on the split. The PROJECTION SHARDS TOO: "
+                        "Qwen3_5MoeExperts passes moe_intermediate_size through undivided, "
+                        "but BatchedSwiGLU.forward divides it (archbench "
+                        "networks/MLP/common/experts.py:50, local_hidden_dim = ceil("
+                        "hidden_dim / model_parallel_size)). So for a TP4 lane --tp 4 is "
+                        "BOTH what a real sglang rank runs and what the projection charges "
+                        "per rank -- that is the setting to validate the model against. "
+                        "--tp 1 is a contrast that isolates what the split costs the "
+                        "kernel; it is not the projection's per-rank shape for a TP4 lane.")
     p.add_argument("--dense-ffn", action="store_true",
                    help="benchmark a DENSE SwiGLU FFN instead of an MoE layer, as the "
                         "num_experts=1 case (which is how archbench models it). Reads no "
@@ -570,6 +597,10 @@ def main() -> int:
                    help="first core of instance 0")
     p.add_argument("--instance-index", type=int, default=0,
                    help=argparse.SUPPRESS)
+    p.add_argument("--label", default=None,
+                   help="lane name recorded verbatim in the results CSV. Without it the "
+                        "aggregator has to reverse-engineer the lane from the shape, "
+                        "which cannot tell a 1x224c contrast from a 4x56c replica lane.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", default=None, help="append results to this CSV")
     p.add_argument("--dry-run", action="store_true",
@@ -650,6 +681,15 @@ def _instance_main(idx: int, cores: List[int], barrier, queue, args, model, mode
         queue.put((idx, rows, None))
     except BaseException as exc:  # noqa: BLE001 - reported to the parent verbatim
         import traceback
+        # ABORT THE BARRIER FIRST. Without this the surviving instances stay in
+        # barrier.wait() forever -- nobody will ever join them -- so they never reach
+        # their own queue.put and the parent's queue.get never gets its N messages.
+        # The whole sweep then hangs instead of failing, which on an overnight run
+        # means no results at all and a shared box held indefinitely.
+        try:
+            barrier.abort()
+        except Exception:
+            pass
         queue.put((idx, [], traceback.format_exc()))
         raise SystemExit(1) from exc
 
@@ -659,14 +699,20 @@ def run_spread(args) -> int:
     core group, all re-synchronised before every timed iteration."""
     import multiprocessing as mp
 
-    ncpu = len(os.sched_getaffinity(0))
+    # Slice the ids we were actually GIVEN, never range(0, n). The count and the ids
+    # are different questions: under a taskset mask or a cgroup cpuset of, say,
+    # {112..223}, range() hands out 0..111 -- which sched_setaffinity happily grants
+    # (an affinity mask is not a privilege boundary), so the instances silently land on
+    # the cores the mask was meant to keep them off, i.e. on the other tenant.
+    avail = sorted(os.sched_getaffinity(0))
+    ncpu = len(avail)
     per = args.cores_per_instance or ncpu // args.instances
     need = args.core_offset + per * args.instances
     if need > ncpu:
         raise SystemExit(f"--instances {args.instances} x --cores-per-instance {per} "
                          f"(+offset {args.core_offset}) needs {need} cores but only "
                          f"{ncpu} are available")
-    groups = [list(range(args.core_offset + i * per, args.core_offset + (i + 1) * per))
+    groups = [avail[args.core_offset + i * per: args.core_offset + (i + 1) * per]
               for i in range(args.instances)]
     print(f"spread: {args.instances} instances x {per} cores, barrier-synced per "
           f"iteration: " + ", ".join(f"{g[0]}-{g[-1]}" for g in groups))
@@ -684,14 +730,35 @@ def run_spread(args) -> int:
              for i in range(args.instances)]
     for p in procs:
         p.start()
+    # Never block forever: a child killed outright (OOM) never reaches its `except`, so
+    # it sends nothing at all and barrier.abort() never runs either. Poll instead, and
+    # give up once every process has exited and the queue is drained.
+    import queue as _queue
     collected, failures = {}, {}
-    for _ in procs:
-        idx, rows, err = queue.get()
+    while len(collected) < len(procs):
+        try:
+            idx, rows, err = queue.get(timeout=5)
+        except _queue.Empty:
+            if all(p.exitcode is not None for p in procs):
+                dead = [i for i, p in enumerate(procs)
+                        if p.exitcode not in (0, None) and i not in collected]
+                for i in dead:
+                    failures[i] = (f"instance {i} exited with code "
+                                   f"{procs[i].exitcode} without reporting (killed?)")
+                    collected[i] = []
+                if len(collected) < len(procs):
+                    for i in range(len(procs)):
+                        collected.setdefault(i, [])
+                        failures.setdefault(i, f"instance {i} produced no rows")
+                break
+            continue
         collected[idx] = rows
         if err:
             failures[idx] = err
     for p in procs:
-        p.join()
+        p.join(timeout=30)
+        if p.is_alive():
+            p.terminate()
 
     if failures:
         for idx, err in sorted(failures.items()):
@@ -790,11 +857,12 @@ def pool_bytes(leg: str, cells: List[Dict], model, copies: int) -> int:
     K, N, E = (model["hidden_size"], model["moe_intermediate_size"],
                model["num_experts"])
     if leg == "fused":
-        # Activations are not copied, but at thr prefill one cell's [num_tokens, K] is
-        # 1.6 GiB, so leaving them out of the estimate understates the pool by more
-        # than the weights of a whole extra copy.
+        # Activations are neither copied nor per-cell: one buffer sized to the largest
+        # cell serves the whole leg, so this is a max and not a sum -- see
+        # make_fused_runner. It still has to be counted: at thr prefill that one buffer
+        # is 1.5 GiB.
         weights = 2 * (E * 2 * N * K + E * K * N) * copies * len(cells)
-        return weights + sum(2 * c["num_tokens"] * K for c in cells)
+        return weights + 2 * max(c["num_tokens"] for c in cells) * K
     # One activation buffer serves every group of every cell, so it is the max over
     # cells and not a sum -- see make_batched_runner.
     weights = sum(sum(nexp * (K * 2 * N + N * K) for nexp, _ in c["groups"])
@@ -852,15 +920,24 @@ def time_cells(args, model, caller, cells: List[Dict], barrier) -> None:
         for group in batches:
             announce_pool(leg, group, args, model)
             t0 = time.perf_counter()
+            import torch
+            K = model["hidden_size"]
             if leg == "fused":
+                # One [max_num_tokens, K] buffer for every cell, bf16 direct (an fp32
+                # draw plus a cast would peak at 6 bytes/element against the 2 the
+                # guard charges).
+                need = max(c["num_tokens"] for c in group) * K
+                acts = torch.randn(need, generator=torch.Generator().manual_seed(
+                    args.seed), dtype=torch.bfloat16) / 10
                 runners = [make(c["counts"], c["num_tokens"], model, caller, args.seed,
-                                copies=args.copies) for c in group]
+                                copies=args.copies, acts=acts) for c in group]
             else:
-                import torch
-                K = model["hidden_size"]
                 need = max(act_elems(c["groups"], K) for c in group)
-                acts = (torch.randn(need, generator=torch.Generator().manual_seed(
-                    args.seed), dtype=torch.float32) / 10).to(torch.bfloat16)
+                # bf16 directly: an fp32 draw plus a cast peaks at 6 bytes/element
+                # while pool_bytes charges 2, and this is the leg's largest tensor
+                # (4.7 GiB at thr prefill, i.e. a 14 GiB transient the guard cannot see).
+                acts = torch.randn(need, generator=torch.Generator().manual_seed(
+                    args.seed), dtype=torch.bfloat16) / 10
                 runners = [make(c["groups"], model, args.seed, copies=args.copies,
                                 acts=acts) for c in group]
             if not args.instance_index:
@@ -940,6 +1017,14 @@ def prepare_cell(args, model, model_key, batch: int, layer: int, csv_file: str,
                stats_mode=args.expert_stats_mode, hidden_size=K,
                moe_intermediate_size=N, num_experts=E, topk=topk,
                tp=args.tp, threads=args.threads or 0,
+               # copies / instances / cores_per_instance decide whether the weights
+               # streamed from DDR or sat in L3, and whether this row is one 224-core
+               # instance or one of four 56-core replicas. Without them a results row
+               # cannot be interpreted after the fact, and two rows that differ 8x in
+               # cache residency look identical.
+               copies=args.copies, instances=args.instances,
+               cores_per_instance=args.cores_per_instance or 0,
+               label=args.label or "",
                num_groups=len(groups), active_experts=active,
                histogram_mass=mass, routed_tokens=R, slack=slack,
                num_tokens=num_tokens, gflop=flops / 1e9,
@@ -971,6 +1056,9 @@ RESULT_FIELDS: List[str] = [
     "batched_median_ms", "batched_min_ms", "batched_mean_ms", "batched_p90_ms",
     "batched_iters",
     "fused_over_batched",
+    # Appended after the original set: `write_rows` reconciles against a header already
+    # on disk, so an older CSV without these columns still accepts new rows.
+    "copies", "instances", "cores_per_instance", "label",
 ]
 
 
