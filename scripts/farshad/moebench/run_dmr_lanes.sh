@@ -40,8 +40,13 @@
 # N/TP of the intermediate (row-parallel down_proj), and the MoE block owns ONE
 # all-reduce over the routed+shared expert sum -- each expert is built with
 # collective_tp_size=1 precisely so that AR is not charged per expert.
-# So the TP4 rt lanes use --tp 4 (N = 512/4 = 128). The `_unsharded` lane is a --tp 1
-# contrast that isolates what the split costs the kernel, not the reference.
+# So the rt lanes use --tp 4 (N = 512/4 = 128), which is BOTH what a real sglang TP4 rank
+# runs and what the projection charges per rank -- the setting a model-vs-measurement
+# compare has to use. Realtime is TP4 only; there is deliberately no --tp 1 rt lane, since
+# N=512 at bs1 is a shape nothing deploys and it cost 4x the rt sweep (402 GiB of cycled
+# expert weights against 100 GiB) to answer a question about split cost rather than about
+# the decomposition. The bs320 thr lanes are TP1 because a throughput deployment on this
+# socket is four INDEPENDENT replicas, which is a real configuration.
 #
 # ============================ POWER / STATE ====================================
 # The governor is read and recorded before and after, and the run REFUSES to start if
@@ -60,6 +65,12 @@
 #   MAXOTHER_CPU=200     refuse to start if OTHER users are burning more than this
 #                        much CPU (percent; 200 = 2 cores). Load average is not used
 #                        for the decision -- see the guard.
+#   MODE=fused|batched   override every lane's --mode, so the whole sweep can be run as
+#                        ONE leg at a time (MODE=fused ... then MODE=batched ...). Default
+#                        empty = each lane keeps the mode written into it. Running the legs
+#                        as separate sweeps costs one extra pool build per lane but keeps
+#                        only one leg's weights resident, and it means a failure in the
+#                        second leg cannot cost you the first leg's numbers.
 #   AB="..."             extra stats-source flags, e.g. AB="--ab-offline"
 #   PY=python3           interpreter (used when IMG is empty)
 #   IMG=<image>          run each cell inside this container instead of on the metal.
@@ -76,8 +87,10 @@
 #   TEMP_MAX=80          do not start the next cell above this package temp (C)
 #   COOLDOWN_MAX=600     give up waiting to cool after this long, and say so
 #   FORCE=1              skip the busy/governor guards
-#   LANES="..."          subset of: 35b_rt 35b_rt_unsharded 35b_thr 35b_thr_socket
+#   LANES="..."          subset of: 35b_rt 35b_thr 35b_thr_socket
 #                        35b_shared_rt 35b_shared_thr 9b_rt 9b_thr
+#                        DEFAULT is the routed-MoE deployment lanes: 35b_rt 35b_thr.
+#                        The shared-expert and 9B-dense lanes are opt-in.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -89,6 +102,7 @@ THREADS_THR=${THREADS_THR:-224}
 LAYERS=${LAYERS:-all}
 MAXOTHER_CPU=${MAXOTHER_CPU:-200}
 AB=${AB:-}
+MODE=${MODE:-}
 PY=${PY:-python3}
 IMG=${IMG:-}
 HOSTROOT=${HOSTROOT:-/home/farshad/moebench}
@@ -99,7 +113,33 @@ FORCE=${FORCE:-0}
 COOLDOWN=${COOLDOWN:-15}
 TEMP_MAX=${TEMP_MAX:-80}
 COOLDOWN_MAX=${COOLDOWN_MAX:-600}
-LANES=${LANES:-"35b_rt 35b_rt_unsharded 35b_thr 35b_shared_rt 35b_shared_thr"}
+# DEFAULT SET = the ROUTED MoE only. The question this benchmark exists to answer is
+# whether the projection's per-bucket decomposition is a good model of the ROUTED
+# experts, and whether sglang's fused kernel beats that decomposition. The shared
+# expert is deliberately OUT: it is the same dense SwiGLU in the archbench model and in
+# sglang, so it contributes the same term to both sides and cancels out of the
+# comparison -- including it can only dilute the ratio being measured. It also would
+# not be measured honestly here (see the 35b_shared_* block below). Ask for it by name
+# if you ever want it.
+LANES=${LANES:-"35b_rt 35b_thr"}
+FAILED_LANES=""
+
+# cpath() only rewrites a path under $HOSTROOT and `docker run` passes no -w, so a
+# relative OUT resolves against the IMAGE's workdir instead of the mount: write_rows
+# then raises FileNotFoundError AFTER the entire sweep, in a --rm container. Refuse now.
+if [ -n "$IMG" ]; then
+  case "$OUT" in
+    "$HOSTROOT"/*) ;;
+    *) echo "IMG is set but OUT=$OUT is not under HOSTROOT=$HOSTROOT, so the container" >&2
+       echo "cannot write there (it sees only $HOSTROOT mounted at /moebench)." >&2
+       echo "Use OUT=$HOSTROOT/<dir>." >&2; exit 2 ;;
+  esac
+  case "$PWD" in
+    "$HOSTROOT"/*|"$HOSTROOT") ;;
+    *) echo "IMG is set but this script lives outside HOSTROOT=$HOSTROOT ($PWD), so the" >&2
+       echo "container would be handed an unmounted path for bench_moe_cpu.py." >&2; exit 2 ;;
+  esac
+fi
 
 mkdir -p "$OUT"
 
@@ -238,18 +278,49 @@ fi
 # drifted apart, so a cell could be timed while its neighbours sat between kernels --
 # which measured a partly-idle socket and produced a 2.28x across-instance spread.
 # The Python driver re-synchronises all instances on a barrier before EVERY iteration
-# and sets OMP_WAIT_POLICY=passive / KMP_BLOCKTIME=0 so idle threads sleep instead of
-# busy-waiting on cores their neighbours need. Measured imbalance after: ~1.07x median.
+# and sets OMP_WAIT_POLICY=active / KMP_BLOCKTIME=200 so idle threads BUSY-WAIT: with the
+# barrier holding the instances in step their idle windows are short and aligned, while
+# sleeping cost a wake-up on every call (0.093 ms -> 5.0 ms on decode bs1 TP4, 54x).
+# Measured imbalance after: ~1.07x median.
 spread() {  # spread <name> <n_instances> <cores_per_instance> <args...>
   local name=$1 n=$2 cores=$3; shift 3
+  # MODE, when set, replaces whatever --mode the lane asked for. A lane written as
+  # `--mode fused` (because both legs would not fit) still runs under MODE=batched, which
+  # is the point: the legs are separate sweeps, so each only ever holds its own pool.
+  if [ -n "$MODE" ]; then
+    local a=() skip=0
+    for x in "$@"; do
+      if [ "$skip" = 1 ]; then skip=0; continue; fi
+      if [ "$x" = "--mode" ]; then skip=1; continue; fi
+      a+=("$x")
+    done
+    set -- "${a[@]}" --mode "$MODE"
+    name="${name}_${MODE}"
+  fi
   echo
   echo "################ $name   (${n} x ${cores}c concurrent, barrier-synced)"
   echo "$(date -Is) before=$name temp=$(pkgtemp)C throttle=$(throttles)" >> "$OUT/thermal.log"
   echo "  pre-cell: $(pkgtemp)C, throttle $(throttles)"
+  # A lane that DIES must be visible and must not be mistaken for one that measured
+  # nothing. `|| true` on the whole pipeline used to discard its status under
+  # `set -o pipefail`, so `set -e` never fired: every lane could fail and the sweep
+  # still exited 0 with an empty console. The `|| true` now belongs to grep alone
+  # (it exits 1 when nothing matches), the driver's status comes from PIPESTATUS,
+  # and the filter carries the strings the driver actually fails with.
+  # `{ pipeline; } || rc=$?` is what keeps `set -e` from killing the sweep here while
+  # still CAPTURING the driver's status: under `pipefail` the pipeline reports the
+  # driver's non-zero exit, and the `||` makes it non-fatal. A bare trailing `|| true`
+  # would swallow the status instead (and reset PIPESTATUS), which is how every lane
+  # could fail while the sweep exited 0 with an empty console.
+  local rc=0
   # shellcheck disable=SC2086
-  runpy "$@" --instances "$n" --cores-per-instance "$cores" --copies "$COPIES" $AB \
-      --out "$(cpath "$OUT")/results.csv" 2>&1 | tee "$OUT/$name.log" \
-    | grep -E "spread:|imbalance|^ +[0-9]+\.[0-9]+x|median imbalance|fused_experts_cpu:|batched GEMMs:|check:|REFUS|Error" || true
+  { runpy "$@" --instances "$n" --cores-per-instance "$cores" --copies "$COPIES" $AB \
+      --label "$name" --out "$(cpath "$OUT")/results.csv" 2>&1 | tee "$OUT/$name.log" \
+    | { grep -E "spread:|imbalance|^ +[0-9]+\.[0-9]+x|median imbalance|fused_experts_cpu:|batched GEMMs:|check:|REFUS|Error|Traceback|SystemExit|pool needs|disagrees|instances failed|no stats rows" || true; } ; } || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "  !! LANE $name FAILED (exit $rc) -- see $OUT/$name.log" >&2
+    FAILED_LANES="$FAILED_LANES $name"
+  fi
   echo "  post-cell: $(pkgtemp)C, throttle $(throttles)"
   cool_down "$name"
 }
@@ -262,14 +333,6 @@ if has 35b_rt; then
       --mode both --check --tp 4 --iters 20 --warmup 5
   spread 35b_rt_prefill "$SPREAD_RT" "$CORES" --phase prefill --batch 1 --layer "$LAYERS" \
       --mode both --tp 4 --iters 10 --warmup 3
-fi
-
-# ---- same, UNSHARDED (--tp 1, N=512): contrast only, not the reference ---------
-if has 35b_rt_unsharded; then
-  spread 35b_rt_unsharded_decode  "$SPREAD_RT" "$CORES" --phase decode  --batch 1 \
-      --layer "$LAYERS" --mode both --iters 20 --warmup 5
-  spread 35b_rt_unsharded_prefill "$SPREAD_RT" "$CORES" --phase prefill --batch 1 \
-      --layer "$LAYERS" --mode both --iters 10 --warmup 3
 fi
 
 # ---- 35B-A3B bf16 throughput: bs320, TP1 = 4 INDEPENDENT 56-core replicas ------
@@ -293,10 +356,30 @@ if has 35b_thr_socket; then
       --layer "$LAYERS" --mode both --iters 10 --warmup 3
 fi
 
-# ---- 35B SHARED expert (dense, K=2048, N=512) ---------------------------------
+# ---- 35B SHARED expert -- NOT IN THE DEFAULT SET, and not a like-for-like measure --
 # The MoE block is routed experts PLUS a shared expert every token passes through
-# (shared_expert_intermediate_size=512, a Qwen3_5MLP with row-parallel down_proj whose
-# partial output joins the same single all-reduce). A layer-level compare needs it.
+# (shared_expert_intermediate_size=512, verified in config_qwen3_5_35B_A3B.json; a
+# Qwen3_5MLP with row-parallel down_proj whose partial output joins the same single
+# all-reduce).
+#
+# OFF BY DEFAULT for two independent reasons:
+#
+#   1. It CANCELS. The shared expert is the same dense SwiGLU on both sides of the
+#      comparison -- archbench models it as a BatchedSwiGLU with num_experts=1 and
+#      sglang runs it as one dense FFN -- so it adds the same term to the projection and
+#      to the measurement. Including it only dilutes the routed-MoE ratio this benchmark
+#      exists to measure.
+#   2. It would NOT be measured honestly by this harness anyway. sglang has a SEPARATE
+#      op for it, `shared_expert_cpu`, which fuses the shared FFN with the multiply by
+#      routed_scaling_factor AND the add of the routed experts' output (it hard-requires
+#      `fused_experts_out`). Routing it through --dense-ffn instead calls
+#      `fused_experts_cpu` with num_experts=1/topk=1, so it pays the routed kernel's
+#      moe_align_block_size + sorted-token machinery that the real shared path does not
+#      have, and it drops the fused epilogue. Different kernel, different work.
+#      Measuring it properly means binding `shared_expert_cpu`, which this harness does
+#      not do.
+#
+# Kept here rather than deleted so the shape is on record: LANES="35b_shared_rt" runs it.
 SHARED35B=(--dense-ffn --hidden-size 2048 --intermediate-size 512)
 if has 35b_shared_rt; then
   spread 35b_shared_rt_decode  "$SPREAD_RT" "$CORES" "${SHARED35B[@]}" --phase decode \
@@ -340,4 +423,9 @@ fi
 
 echo
 echo "done. per-instance CSVs:"
-wc -l "$OUT"/results.inst*.csv 2>/dev/null || echo "  none written"
+wc -l "$OUT"/results*.csv 2>/dev/null || echo "  none written"
+if [ -n "$FAILED_LANES" ]; then
+  echo
+  echo "FAILED LANES:$FAILED_LANES" >&2
+  exit 1
+fi
