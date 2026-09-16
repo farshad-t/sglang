@@ -243,7 +243,12 @@ at::Tensor fused_experts_cpu(
     const std::optional<double>& /*alpha*/,
     const std::optional<double>& /*limit*/,
     bool /*is_vnni*/,
-    const std::optional<std::string>& activation) {
+    const std::optional<std::string>& activation,
+    int64_t expert_batching_mode) {
+  TORCH_CHECK(
+      expert_batching_mode == 0,
+      "fused_experts_cpu on ARM64 only supports expert_batching_mode=0, got: ",
+      expert_batching_mode);
   const auto st = hidden_states.scalar_type();
   CHECK_INPUT(hidden_states);
   CHECK_INPUT(w13);

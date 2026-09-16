@@ -1,5 +1,9 @@
 #include "moe.h"
 
+#include <algorithm>
+#include <utility>
+#include <vector>
+
 #include "common.h"
 #include "gemm.h"
 
@@ -648,6 +652,216 @@ void fused_experts_kernel_impl(
   });
 }
 
+// Mode-1 sibling of fused_experts_kernel_impl. Same math, different batching: the
+// active experts are grouped into buckets of equal token count and each bucket runs as
+// one batched GEMM [G, m, K] x [G, K, 2N], then a standalone activation pass, then
+// [G, m, N] x [G, N, K] -- the decomposition scripts/farshad/moebench measures as
+// "unfused", with the gather and the topk-weighted scatter still done here.
+//
+// Not bit-identical to mode 0: gate|up is materialized in scalar_t before the
+// activation reads it, and the brgemm-vs-tinygemm choice is per bucket, not global.
+template <typename scalar_t>
+void fused_experts_batched_kernel_impl(
+    scalar_t* __restrict__ output,
+    scalar_t* __restrict__ ic0,
+    scalar_t* __restrict__ ic1,
+    scalar_t* __restrict__ ic2,
+    scalar_t* __restrict__ A_tmp,
+    float* __restrict__ C_tmp,
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ packed_w1,
+    const scalar_t* __restrict__ packed_w2,
+    const float* __restrict__ w1_bias,
+    const float* __restrict__ w2_bias,
+    const float* __restrict__ topk_weights,
+    const int32_t* __restrict__ sorted_ids,
+    const int32_t* __restrict__ cumsums,
+    const int32_t* __restrict__ offsets,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t E,
+    int64_t topk,
+    CPUActMethod act_func,
+    bool with_bias) {
+  constexpr int64_t BLOCK_M = block_size_m();
+  constexpr int64_t BLOCK_N = block_size_n();
+
+  TORCH_CHECK(N % BLOCK_N == 0, "Fixme when N is not multiples of ", BLOCK_N);
+  TORCH_CHECK(act_func != CPUActMethod::swiglu, "expert_batching_mode=1: clamped swiglu not implemented.");
+
+  // (token count, expert id) for the active experts. cumsums[e] is expert e's first
+  // padded token, offsets[] the prefix sum of the unpadded per-block counts, so their
+  // difference is the exact token count and offsets[] also gives the ic0/ic1 row base.
+  std::vector<std::pair<int32_t, int32_t>> active;
+  active.reserve(E);
+  for (int32_t e = 0; e < E; ++e) {
+    const int32_t cnt = offsets[cumsums[e + 1] / BLOCK_M] - offsets[cumsums[e] / BLOCK_M];
+    if (cnt > 0) {
+      active.emplace_back(cnt, e);
+    }
+  }
+  // descending count: the widest GEMM of the layer runs first
+  std::sort(active.begin(), active.end(), std::greater<std::pair<int32_t, int32_t>>());
+
+  // w1: [E, 2N, K], w2: [E, K, N], both as [E, OC, IC] and vnni-packed
+  const int64_t stride_e1 = 2 * N * K;
+  const int64_t stride_e2 = K * N;
+  const int64_t NB1 = 2 * N / BLOCK_N;
+  const int64_t NB2 = div_up(K, BLOCK_N);
+
+  for (size_t bucket_begin = 0; bucket_begin < active.size();) {
+    const int64_t tokens = active[bucket_begin].first;
+    size_t bucket_end = bucket_begin;
+    while (bucket_end < active.size() && active[bucket_end].first == tokens) {
+      ++bucket_end;
+    }
+    // one batched GEMM per bucket: G experts, m rows each, split into MB blocks of rows
+    const int64_t G = bucket_end - bucket_begin;
+    const int64_t MB = div_up(tokens, BLOCK_M);
+    const bool use_brgemm = can_use_brgemm<scalar_t>(std::min(tokens, BLOCK_M));
+    const std::pair<int32_t, int32_t>* bucket = active.data() + bucket_begin;
+
+    // gemm1: ic0 = gather(hidden_states) @ w1, over the full 2N of gate|up
+    parallel_2d(G * MB, NB1, [&](int64_t rb0, int64_t rb1, int64_t nb0, int64_t nb1) {
+      int tid = get_thread_num();
+      scalar_t* __restrict__ A = A_tmp + tid * BLOCK_M * K;
+      float* __restrict__ C = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
+
+      loop_2d<scalar_t>(rb0, rb1, nb0, nb1, BLOCK_N * K, [&](int64_t rb, int64_t nb, int64_t nb_offset) {
+        const int32_t expert_id = bucket[rb / MB].second;
+        const int64_t mb = cumsums[expert_id] / BLOCK_M + rb % MB;
+        const int64_t m_size = offsets[mb + 1] - offsets[mb];
+        const int32_t* __restrict__ A_ids = sorted_ids + mb * BLOCK_M;
+
+        if (nb_offset == 0) {
+          for (int64_t m = 0; m < m_size; ++m) {
+            copy_stub(A + m * K, input + (A_ids[m] / topk) * K, K);
+          }
+        }
+
+        const scalar_t* __restrict__ B = packed_w1 + expert_id * stride_e1 + nb * BLOCK_N * K;
+        if (use_brgemm) {
+          at::native::cpublas::brgemm(
+              /* M     */ m_size,
+              /* N     */ BLOCK_N,
+              /* K     */ K,
+              /* lda   */ K,
+              /* ldb   */ BLOCK_N,
+              /* ldc   */ BLOCK_N,
+              /* add_C */ false,
+              /* A     */ A,
+              /* B     */ B,
+              /* C     */ C);
+        } else {
+          tinygemm_kernel(
+              /* A     */ A,
+              /* B     */ B,
+              /* C     */ C,
+              /* M     */ m_size,
+              /* N     */ BLOCK_N,
+              /* K     */ K,
+              /* lda   */ K,
+              /* ldb   */ BLOCK_N,
+              /* ldc   */ BLOCK_N);
+        }
+        if (with_bias) {
+          const float* __restrict__ B_bias = w1_bias + expert_id * 2 * N + nb * BLOCK_N;
+          for (int64_t m = 0; m < m_size; ++m) {
+            add_bias_stub(C + m * BLOCK_N, B_bias, BLOCK_N);
+          }
+        }
+        scalar_t* __restrict__ h = ic0 + offsets[mb] * 2 * N + nb * BLOCK_N;
+        for (int64_t m = 0; m < m_size; ++m) {
+          copy_stub(h + m * 2 * N, C + m * BLOCK_N, BLOCK_N);
+        }
+      });
+
+      if (use_brgemm) {
+        at::native::cpublas::brgemm_release();
+      }
+    });
+
+    // activation: ic1 = act(ic0[:, :N]) * ic0[:, N:], one pass over the bucket's rows
+    at::parallel_for(0, G * tokens, std::max<int64_t>(1, GRAIN_SIZE / N), [&](int64_t begin, int64_t end) {
+      for (int64_t i = begin; i < end; ++i) {
+        const int32_t expert_id = bucket[i / tokens].second;
+        const int64_t row = offsets[cumsums[expert_id] / BLOCK_M] + i % tokens;
+        const scalar_t* __restrict__ h = ic0 + row * 2 * N;
+        if (act_func == CPUActMethod::gelu_and_mul) {
+          gelu_and_mul_stub(ic1 + row * N, h, h + N, N);
+        } else {
+          silu_and_mul_stub(ic1 + row * N, h, h + N, N);
+        }
+      }
+    });
+
+    // gemm2: ic2 = ic1 @ w2, scattered back to routed-slot order and topk-weighted
+    parallel_2d(G * MB, NB2, [&](int64_t rb0, int64_t rb1, int64_t nb0, int64_t nb1) {
+      int tid = get_thread_num();
+      float* __restrict__ C = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
+
+      loop_2d<scalar_t>(rb0, rb1, nb0, nb1, BLOCK_N * N, [&](int64_t rb, int64_t nb, int64_t nb_offset) {
+        const int32_t expert_id = bucket[rb / MB].second;
+        const int64_t mb = cumsums[expert_id] / BLOCK_M + rb % MB;
+        const int64_t m_size = offsets[mb + 1] - offsets[mb];
+        const int64_t n_size = std::min(K - nb * BLOCK_N, BLOCK_N);
+        const scalar_t* __restrict__ A = ic1 + offsets[mb] * N;
+        const int32_t* __restrict__ A_ids = sorted_ids + mb * BLOCK_M;
+
+        const scalar_t* __restrict__ B = packed_w2 + expert_id * stride_e2 + nb * BLOCK_N * N;
+        if (use_brgemm) {
+          at::native::cpublas::brgemm(
+              /* M     */ m_size,
+              /* N     */ n_size,
+              /* K     */ N,
+              /* lda   */ N,
+              /* ldb   */ n_size,
+              /* ldc   */ BLOCK_N,
+              /* add_C */ false,
+              /* A     */ A,
+              /* B     */ B,
+              /* C     */ C);
+        } else {
+          tinygemm_kernel(
+              /* A     */ A,
+              /* B     */ B,
+              /* C     */ C,
+              /* M     */ m_size,
+              /* N     */ n_size,
+              /* K     */ N,
+              /* lda   */ N,
+              /* ldb   */ n_size,
+              /* ldc   */ BLOCK_N);
+        }
+        if (with_bias) {
+          const float* __restrict__ B_bias = w2_bias + expert_id * K + nb * BLOCK_N;
+          for (int64_t m = 0; m < m_size; ++m) {
+            add_bias_stub(C + m * BLOCK_N, B_bias, n_size);
+          }
+        }
+        for (int64_t m = 0; m < m_size; ++m) {
+          const int32_t index = A_ids[m];
+          copy_mul_stub(ic2 + index * K + nb * BLOCK_N, C + m * BLOCK_N, topk_weights[index], n_size);
+        }
+      });
+
+      if (use_brgemm) {
+        at::native::cpublas::brgemm_release();
+      }
+    });
+
+    bucket_begin = bucket_end;
+  }
+
+  // out = ic2.sum(dim=1), from [M, topk, K] to [M, K]
+  at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t m = begin; m < end; ++m) {
+      sum_stub(output + m * K, ic2 + m * topk * K, topk, K);
+    }
+  });
+}
+
 template <typename scalar_t>
 void shared_expert_kernel_impl(
     scalar_t* __restrict__ output,
@@ -889,8 +1103,26 @@ at::Tensor fused_experts_cpu(
     const std::optional<double>& alpha,
     const std::optional<double>& limit,
     bool is_vnni,
-    const std::optional<std::string>& activation) {
+    const std::optional<std::string>& activation,
+    int64_t expert_batching_mode) {
   const CPUActMethod act_func = act_method_from_string(activation, alpha.has_value() && limit.has_value());
+  TORCH_CHECK(
+      expert_batching_mode == 0 || expert_batching_mode == 1,
+      "fused_experts_cpu: expert_batching_mode must be 0 (per token block) or 1 (batched per expert bucket), got ",
+      expert_batching_mode);
+  bool use_batched_experts = expert_batching_mode == 1;
+  if (use_batched_experts && !(moe_comp_method == CPUQuantMethod::BF16)) {
+    TORCH_WARN_ONCE(
+        "fused_experts_cpu: expert_batching_mode=1 is implemented for bf16/fp16 weights only, "
+        "falling back to mode 0 for moe_comp_method=",
+        moe_comp_method);
+    use_batched_experts = false;
+  }
+  if (use_batched_experts && act_func == CPUActMethod::swiglu) {
+    TORCH_WARN_ONCE(
+        "fused_experts_cpu: expert_batching_mode=1 does not implement clamped swiglu, falling back to mode 0");
+    use_batched_experts = false;
+  }
   // the int8 and int4 kernels hardcode silu in their fused store step
   const bool is_int_quant =
       moe_comp_method == CPUQuantMethod::INT8_W8A8 || moe_comp_method == CPUQuantMethod::INT4_W4A8;
@@ -1023,6 +1255,10 @@ at::Tensor fused_experts_cpu(
   if (moe_comp_method == CPUQuantMethod::INT4_W4A8) {
     buffer_size_nbytes += M * topk * 2 * N * 2 + std::max(M * K, M * topk * N) + M * topk * sizeof(float) +
                           num_threads * 2 * get_4bit_block_k_size(K / w1_scale.value().size(2)) * BLOCK_N;
+  }
+  if (use_batched_experts) {
+    // 9. intermediate_cache0 : [M * topk, 2N], gate|up before the activation pass
+    buffer_size_nbytes += M * topk * 2 * N * 2;
   }
   auto buffer2 = at::empty({buffer_size_nbytes}, hidden_states.options().dtype(at::kChar));
 
@@ -1194,6 +1430,35 @@ at::Tensor fused_experts_cpu(
       scalar_t* __restrict__ A_tmp = intermediate_cache2 + M * topk * K;
       float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
       bool with_bias = w1_bias.has_value();
+
+      if (use_batched_experts) {
+        scalar_t* __restrict__ intermediate_cache0 = (scalar_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
+
+        fused_experts_batched_kernel_impl<scalar_t>(
+            out_hidden_states.data_ptr<scalar_t>(),
+            intermediate_cache0,
+            intermediate_cache1,
+            intermediate_cache2,
+            A_tmp,
+            C_tmp,
+            hidden_states.data_ptr<scalar_t>(),
+            packed_w1.data_ptr<scalar_t>(),
+            packed_w2.data_ptr<scalar_t>(),
+            with_bias ? w1_bias.value().data_ptr<float>() : nullptr,
+            with_bias ? w2_bias.value().data_ptr<float>() : nullptr,
+            topk_weights_.data_ptr<float>(),
+            sorted_ids,
+            cumsums,
+            offsets,
+            M,
+            N,
+            K,
+            E,
+            topk,
+            act_func,
+            with_bias);
+        return;
+      }
 
       fused_experts_kernel_impl<scalar_t>(
           out_hidden_states.data_ptr<scalar_t>(),
