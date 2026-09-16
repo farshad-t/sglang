@@ -34,6 +34,9 @@ REGIMES = {
     "decode": (72, {1: 64, 2: 64, 3: 64, 6: 32}),
     "prefill": (16384, {512: 256}),
     "prefill_hot": (32768, {32768: 8}),
+    # 8192 tokens/expert across all 256 experts: the "tens of thousands per expert"
+    # end WITHOUT concentrating routing onto a handful of experts. ~29 GiB/instance.
+    "prefill_big": (262144, {8192: 256}),
 }
 
 
@@ -196,17 +199,29 @@ def instance(idx, cores, barrier, q, a):
     for nm in names:
         for _ in range(a.warmup):
             rungs[nm]()
-    out = {}
-    for nm in names:
-        fn = rungs[nm]
+    samples = {nm: [] for nm in names}
+    if a.interleave:
+        # Round-robin the rungs INSIDE the iteration loop, so a drift over the run (AMX
+        # frequency ramp, page placement settling, allocator growth) lands on every rung
+        # equally instead of on whichever one is timed first.
         barrier.wait()
-        s = []
-        for _ in range(a.iters):
+        for it in range(a.iters):
+            order = names if it % 2 == 0 else names[::-1]
+            for nm in order:
+                barrier.wait()
+                t0 = time.perf_counter()
+                rungs[nm]()
+                samples[nm].append((time.perf_counter() - t0) * 1000)
+    else:
+        for nm in names:
             barrier.wait()
-            t0 = time.perf_counter()
-            fn()
-            s.append((time.perf_counter() - t0) * 1000)
-        out[nm] = dict(median_ms=statistics.median(s), min_ms=min(s), max_ms=max(s))
+            for _ in range(a.iters):
+                barrier.wait()
+                t0 = time.perf_counter()
+                rungs[nm]()
+                samples[nm].append((time.perf_counter() - t0) * 1000)
+    out = {nm: dict(median_ms=statistics.median(v), min_ms=min(v), max_ms=max(v))
+           for nm, v in samples.items()}
     hist = {wk["c"]: wk["G"] for wk in st["work"]}
     q.put((idx, dict(out, _meta=dict(cores=len(cores), num_tokens=num_tokens,
                                      routed=st["routed"], hist=hist))))
@@ -222,6 +237,7 @@ def main():
     p.add_argument("--seed", type=int, default=4242)
     p.add_argument("--rungs", default="mode0,mode2,unfused,unfused_wide")
     p.add_argument("--skip-first-core", action="store_true")
+    p.add_argument("--interleave", action="store_true")
     p.add_argument("--arena-gib", type=int, default=4)
     p.add_argument("--out-json", default="")
     a = p.parse_args()
