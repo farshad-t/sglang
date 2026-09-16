@@ -473,7 +473,9 @@ void fused_experts_kernel_impl(
       if constexpr (kSkipGatherAndReduce) {
         // offsets[mb] counts padded routed rows and so overruns input's M rows; wrap it to
         // keep the slice in bounds while still spreading the blocks over the whole tensor.
-        A = input + (offsets[mb] % (M - BLOCK_M)) * K;
+        // A token routes to topk DISTINCT experts, so an expert takes it at most once and
+        // m_size <= M: a contiguous m_size-row slice always exists, down to M = 1.
+        A = input + (offsets[mb] % (M - m_size + 1)) * K;
       } else if (nb_offset == 0) {
         // 1.a load A
         const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
@@ -1200,12 +1202,29 @@ at::Tensor fused_experts_cpu(
   int64_t E = w1.size(0);
   int64_t topk = topk_weights_.size(1);
 
-  if (skip_gather_and_reduce && M <= BLOCK_M) {
-    TORCH_WARN_ONCE(
-        "fused_experts_cpu: expert_batching_mode=2 needs more than block_size_m() tokens to cut a "
-        "contiguous BLOCK_M slice from, falling back to mode 0 for M=",
-        M);
-    skip_gather_and_reduce = false;
+  // Mode 2 slices m_size contiguous rows out of input, so it needs m_size <= M. m_size never
+  // exceeds BLOCK_M, so M >= BLOCK_M is safe for free; below that it holds only when topk_ids
+  // is distinct per row, and M is then small enough to check in at most BLOCK_M * topk^2 ops.
+  if (skip_gather_and_reduce && M < BLOCK_M) {
+    const int32_t* __restrict__ ids = topk_ids_.data_ptr<int32_t>();
+    bool distinct = true;
+    for (int64_t m = 0; m < M && distinct; ++m) {
+      for (int64_t i = 0; i < topk && distinct; ++i) {
+        for (int64_t j = i + 1; j < topk; ++j) {
+          if (ids[m * topk + i] == ids[m * topk + j]) {
+            distinct = false;
+            break;
+          }
+        }
+      }
+    }
+    if (!distinct) {
+      TORCH_WARN_ONCE(
+          "fused_experts_cpu: expert_batching_mode=2 with M < block_size_m() needs topk_ids "
+          "distinct per row, falling back to mode 0 for M=",
+          M);
+      skip_gather_and_reduce = false;
+    }
   }
 
   // we use int32_t compensation for int8 w8a8
