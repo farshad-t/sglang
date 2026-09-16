@@ -1,6 +1,7 @@
 #include "moe.h"
 
 #include <algorithm>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -398,7 +399,12 @@ void tinygemm_kernel(
   }
 }
 
-template <typename scalar_t>
+// kSkipGatherAndReduce selects expert_batching_mode=2: stage 1 reads a contiguous
+// activation slice instead of gathering routed rows, and the [M, topk, K] -> [M, K]
+// reduce never runs, so `output` is left uninitialized. Timing instrument only -- the
+// result is wrong on purpose. The gemm tiles are untouched, so the matmul FLOPs match
+// mode 0 exactly; what mode 2 drops is the gather's copy and the reduce's adds.
+template <typename scalar_t, bool kSkipGatherAndReduce = false>
 void fused_experts_kernel_impl(
     scalar_t* __restrict__ output,
     scalar_t* __restrict__ ic1,
@@ -445,7 +451,7 @@ void fused_experts_kernel_impl(
   parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
     // get local pointers
     int tid = get_thread_num();
-    scalar_t* __restrict__ A = A_tmp + tid * BLOCK_M * K;
+    scalar_t* __restrict__ A_buf = A_tmp + tid * BLOCK_M * K;
     float* __restrict__ C0 = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
     float* __restrict__ C1 = C0 + BLOCK_M * BLOCK_N;
 
@@ -463,12 +469,17 @@ void fused_experts_kernel_impl(
 
       int64_t m_size = offsets[mb + 1] - offsets[mb];
 
-      if (nb_offset == 0) {
+      const scalar_t* __restrict__ A = A_buf;
+      if constexpr (kSkipGatherAndReduce) {
+        // offsets[mb] counts padded routed rows and so overruns input's M rows; wrap it to
+        // keep the slice in bounds while still spreading the blocks over the whole tensor.
+        A = input + (offsets[mb] % (M - BLOCK_M)) * K;
+      } else if (nb_offset == 0) {
         // 1.a load A
         const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
         for (int64_t m = 0; m < m_size; ++m) {
           int32_t index = A_ids[m] / topk;
-          copy_stub(A + m * K, input + index * K, K);
+          copy_stub(A_buf + m * K, input + index * K, K);
         }
       }
 
@@ -645,11 +656,13 @@ void fused_experts_kernel_impl(
 
   // stage 3: out = intermediate_cache2.sum(dim=1)
   //   from [M, topk, K] to [M, K]
-  at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {
-    for (int64_t m = begin; m < end; ++m) {
-      sum_stub(output + m * K, ic2 + m * topk * K, topk, K);
-    }
-  });
+  if constexpr (!kSkipGatherAndReduce) {
+    at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {
+      for (int64_t m = begin; m < end; ++m) {
+        sum_stub(output + m * K, ic2 + m * topk * K, topk, K);
+      }
+    });
+  }
 }
 
 // Mode-1 sibling of fused_experts_kernel_impl. Same math, different batching: the
@@ -1107,10 +1120,25 @@ at::Tensor fused_experts_cpu(
     int64_t expert_batching_mode) {
   const CPUActMethod act_func = act_method_from_string(activation, alpha.has_value() && limit.has_value());
   TORCH_CHECK(
-      expert_batching_mode == 0 || expert_batching_mode == 1,
-      "fused_experts_cpu: expert_batching_mode must be 0 (per token block) or 1 (batched per expert bucket), got ",
+      expert_batching_mode == 0 || expert_batching_mode == 1 || expert_batching_mode == 2,
+      "fused_experts_cpu: expert_batching_mode must be 0 (per token block), 1 (batched per expert bucket) or "
+      "2 (mode 0 minus the gather and the reduce), got ",
       expert_batching_mode);
   bool use_batched_experts = expert_batching_mode == 1;
+  bool skip_gather_and_reduce = expert_batching_mode == 2;
+  if (skip_gather_and_reduce) {
+    TORCH_WARN_ONCE(
+        "fused_experts_cpu: expert_batching_mode=2 RETURNS A WRONG RESULT BY DESIGN. It reads a contiguous "
+        "activation slice instead of the routed rows and never reduces [M, topk, K] to [M, K], so the output "
+        "tensor is left uninitialized. It exists only to time the gemms with gather and scatter priced out.");
+  }
+  if (skip_gather_and_reduce && !(moe_comp_method == CPUQuantMethod::BF16)) {
+    TORCH_WARN_ONCE(
+        "fused_experts_cpu: expert_batching_mode=2 is implemented for bf16/fp16 weights only, "
+        "falling back to mode 0 for moe_comp_method=",
+        moe_comp_method);
+    skip_gather_and_reduce = false;
+  }
   if (use_batched_experts && !(moe_comp_method == CPUQuantMethod::BF16)) {
     TORCH_WARN_ONCE(
         "fused_experts_cpu: expert_batching_mode=1 is implemented for bf16/fp16 weights only, "
@@ -1171,6 +1199,14 @@ at::Tensor fused_experts_cpu(
                                                            : w1.size(1) / 2;
   int64_t E = w1.size(0);
   int64_t topk = topk_weights_.size(1);
+
+  if (skip_gather_and_reduce && M <= BLOCK_M) {
+    TORCH_WARN_ONCE(
+        "fused_experts_cpu: expert_batching_mode=2 needs more than block_size_m() tokens to cut a "
+        "contiguous BLOCK_M slice from, falling back to mode 0 for M=",
+        M);
+    skip_gather_and_reduce = false;
+  }
 
   // we use int32_t compensation for int8 w8a8
   int64_t packed_K = get_row_size(static_cast<CPUQuantMethod>(moe_comp_method), K);
@@ -1460,31 +1496,39 @@ at::Tensor fused_experts_cpu(
         return;
       }
 
-      fused_experts_kernel_impl<scalar_t>(
-          out_hidden_states.data_ptr<scalar_t>(),
-          intermediate_cache1,
-          intermediate_cache2,
-          A_tmp,
-          C_tmp,
-          hidden_states.data_ptr<scalar_t>(),
-          packed_w1.data_ptr<scalar_t>(),
-          packed_w2.data_ptr<scalar_t>(),
-          with_bias ? w1_bias.value().data_ptr<float>() : nullptr,
-          with_bias ? w2_bias.value().data_ptr<float>() : nullptr,
-          topk_weights_.data_ptr<float>(),
-          sorted_ids,
-          expert_ids,
-          offsets,
-          M,
-          N,
-          K,
-          E,
-          topk,
-          num_tokens_post_pad,
-          alpha.has_value() ? float(alpha.value()) : 0,
-          limit.has_value() ? float(limit.value()) : 0,
-          act_func,
-          with_bias);
+      // tag dispatch so mode 2 is a separate instantiation and mode 0 keeps its codegen
+      auto run_fused_experts = [&](auto skip_gather_and_reduce_tag) {
+        fused_experts_kernel_impl<scalar_t, decltype(skip_gather_and_reduce_tag)::value>(
+            out_hidden_states.data_ptr<scalar_t>(),
+            intermediate_cache1,
+            intermediate_cache2,
+            A_tmp,
+            C_tmp,
+            hidden_states.data_ptr<scalar_t>(),
+            packed_w1.data_ptr<scalar_t>(),
+            packed_w2.data_ptr<scalar_t>(),
+            with_bias ? w1_bias.value().data_ptr<float>() : nullptr,
+            with_bias ? w2_bias.value().data_ptr<float>() : nullptr,
+            topk_weights_.data_ptr<float>(),
+            sorted_ids,
+            expert_ids,
+            offsets,
+            M,
+            N,
+            K,
+            E,
+            topk,
+            num_tokens_post_pad,
+            alpha.has_value() ? float(alpha.value()) : 0,
+            limit.has_value() ? float(limit.value()) : 0,
+            act_func,
+            with_bias);
+      };
+      if (skip_gather_and_reduce) {
+        run_fused_experts(std::true_type{});
+      } else {
+        run_fused_experts(std::false_type{});
+      }
     }
   });
   return out_hidden_states;
