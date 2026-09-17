@@ -36,6 +36,11 @@ echo "torch $TV  ->  -DCMAKE_CXX_STANDARD=$STD"
 echo "Torch_DIR=$TD"
 echo "src=$SRC  build=$B  j=$J"
 
+# A box that has built this kernel before usually has cmake and ninja as pip wheels inside
+# the run interpreter's own env, where they are on no PATH until it is activated.
+PATH="$(cd "$(dirname "$PY")" && pwd):$PATH"
+export PATH
+
 if ! command -v cmake >/dev/null || ! command -v ninja >/dev/null; then
   T=/tmp/kbuildtools
   echo "cmake/ninja missing on this box; installing them into $T (a scratch venv, so the"
@@ -48,7 +53,12 @@ fi
 echo "cmake=$(command -v cmake)  ninja=$(command -v ninja)"
 
 rm -rf "$B"; mkdir -p "$B"; cd "$B"
+# The CMakeLists calls find_package(Python ...), so the hint is Python_EXECUTABLE --
+# Python3_EXECUTABLE is silently IGNORED ("Manually-specified variables were not used"), and
+# cmake then picks whatever interpreter it finds first. That builds a .so for the wrong
+# CPython ABI, which only shows up later as ModuleNotFoundError: No module named common_ops.
 cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD="$STD" \
+      -DPython_EXECUTABLE="$PY" -DPython_ROOT_DIR="$(dirname "$(dirname "$PY")")" \
       -DTorch_DIR="$TD" "$SRC" > configure.log 2>&1 || {
   echo "CONFIGURE FAILED -- tail of $B/configure.log:" >&2
   tail -30 configure.log >&2
@@ -67,6 +77,13 @@ ninja -j "$J" > build.log 2>&1 || {
 }
 SO=$(ls "$B"/common_ops*.so)
 echo "built $SO"
+# Catch an ABI mismatch here rather than as a ModuleNotFoundError three steps later.
+TAG=$("$PY" -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
+case "$SO" in
+  *"$TAG") ;;
+  *) echo "ABI MISMATCH: built $(basename "$SO") but $PY loads *$TAG. cmake resolved a "\
+          "different interpreter than PY." >&2; exit 5 ;;
+esac
 
 echo "=== verifying both modes run ==="
 MOEBENCH_KERNEL_SO_DIR="$B" "$PY" - <<PY
@@ -85,9 +102,11 @@ tid = torch.stack([torch.randperm(E, generator=g)[:TOPK] for _ in range(T)]).to(
 tw = (torch.rand((T, TOPK), generator=g) + 0.5) / TOPK
 p1 = torch.ops.sgl_kernel.convert_weight_packed(w1)
 p2 = torch.ops.sgl_kernel.convert_weight_packed(w2)
-# Every argument positionally: only `activation` and `expert_batching_mode` carry schema
+# Every argument positionally: only activation and expert_batching_mode carry schema
 # defaults, so the optional scale/zero/bias tensors have to be passed as explicit None.
-for m in (0, 2):
+# No backticks in this heredoc -- it is unquoted so \$B expands, which means backticks
+# would run as command substitution.
+for m in (0, 2, 3):
     out = op(hs, p1, p2, tw, tid, False, 0,
              None, None, None, None, None, None, None, None, None,
              True, "silu", m)
