@@ -412,7 +412,11 @@ void tinygemm_kernel(
 // decomposition does NOT have, since its gemm2 writes straight into a contiguous buffer.
 // So mode 0 - mode 2 prices gather + reduce, mode 2 - mode 3 prices the scatter, and mode 3
 // is the fused kernel reduced to the work the unfused leg actually does.
-template <typename scalar_t, bool kSkipGatherAndReduce = false, bool kSkipScatter = false>
+template <
+    typename scalar_t,
+    bool kSkipGatherAndReduce = false,
+    bool kSkipScatter = false,
+    bool kSkipActivation = false>
 void fused_experts_kernel_impl(
     scalar_t* __restrict__ output,
     scalar_t* __restrict__ ic1,
@@ -454,6 +458,14 @@ void fused_experts_kernel_impl(
 
   int64_t avg_M = std::max(int64_t(1), M * topk / E);
   const bool use_brgemm = can_use_brgemm<scalar_t>(avg_M);
+  if constexpr (kSkipActivation) {
+    // The tinygemm path folds silu into the gemm's own store (tinygemm_kernel_nn2), so there is
+    // no separate activation pass to remove and mode 4 degenerates to mode 3 there.
+    TORCH_WARN_ONCE(
+        !use_brgemm || act_func != CPUActMethod::silu_and_mul,
+        "fused_experts_cpu: expert_batching_mode=4 can only drop the activation on the brgemm "
+        "silu_and_mul path; here it is identical to mode 3.");
+  }
 
   // here we only parallel on half of 2N to fuse silu_and_mul with gemm
   parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
@@ -569,7 +581,14 @@ void fused_experts_kernel_impl(
       const int64_t offset = offsets[mb];
       if (act_func == CPUActMethod::silu_and_mul && use_brgemm) {
         for (int64_t m = 0; m < m_size; ++m) {
-          silu_and_mul_stub(ic1 + (offset + m) * N + nb * BLOCK_N, C0 + m * BLOCK_N, C1 + m * BLOCK_N, BLOCK_N);
+          if constexpr (kSkipActivation) {
+            // Mode 4: store the gate accumulator converted to bf16 and nothing else, so stage 1
+            // is two gemms plus a store -- what benchdnn times for these same shapes. The up
+            // half is still computed; only silu(gate) * up is gone.
+            copy_stub(ic1 + (offset + m) * N + nb * BLOCK_N, C0 + m * BLOCK_N, BLOCK_N);
+          } else {
+            silu_and_mul_stub(ic1 + (offset + m) * N + nb * BLOCK_N, C0 + m * BLOCK_N, C1 + m * BLOCK_N, BLOCK_N);
+          }
         }
       } else if (act_func == CPUActMethod::gelu_and_mul) {
         for (int64_t m = 0; m < m_size; ++m) {
@@ -1184,16 +1203,20 @@ at::Tensor fused_experts_cpu(
     const std::optional<double>& limit,
     bool is_vnni,
     const std::optional<std::string>& activation,
-    int64_t expert_batching_mode) {
+    int64_t expert_batching_mode,
+    const std::optional<at::Tensor>& routing_buffer,
+    const std::optional<at::Tensor>& workspace) {
   const CPUActMethod act_func = act_method_from_string(activation, alpha.has_value() && limit.has_value());
   TORCH_CHECK(
-      expert_batching_mode >= 0 && expert_batching_mode <= 3,
+      expert_batching_mode >= 0 && expert_batching_mode <= 4,
       "fused_experts_cpu: expert_batching_mode must be 0 (per token block), 1 (batched per expert bucket), "
-      "2 (mode 0 minus the gather and the reduce) or 3 (mode 2 minus the topk-weighted scatter), got ",
+      "2 (mode 0 minus the gather and the reduce), 3 (mode 2 minus the topk-weighted scatter) or 4 (mode 3 "
+      "minus the activation), got ",
       expert_batching_mode);
   bool use_batched_experts = expert_batching_mode == 1;
-  bool skip_gather_and_reduce = expert_batching_mode == 2 || expert_batching_mode == 3;
-  bool skip_scatter = expert_batching_mode == 3;
+  bool skip_gather_and_reduce = expert_batching_mode >= 2;
+  bool skip_scatter = expert_batching_mode >= 3;
+  bool skip_activation = expert_batching_mode == 4;
   if (skip_gather_and_reduce) {
     TORCH_WARN_ONCE(
         "fused_experts_cpu: expert_batching_mode=2 RETURNS A WRONG RESULT BY DESIGN. It reads a contiguous "
@@ -1213,6 +1236,13 @@ at::Tensor fused_experts_cpu(
         moe_comp_method);
     skip_gather_and_reduce = false;
     skip_scatter = false;
+    skip_activation = false;
+  }
+  if (skip_activation) {
+    TORCH_WARN_ONCE(
+        "fused_experts_cpu: expert_batching_mode=4 is mode 3 with the silu_and_mul pass replaced by a plain "
+        "store of the gate accumulator, so stage 1 is two gemms and a store -- what benchdnn times for these "
+        "shapes. Timing instrument only.");
   }
   if (use_batched_experts && !(moe_comp_method == CPUQuantMethod::BF16)) {
     TORCH_WARN_ONCE(
@@ -1298,6 +1328,7 @@ at::Tensor fused_experts_cpu(
           M);
       skip_gather_and_reduce = false;
       skip_scatter = false;
+      skip_activation = false;
     }
   }
 
@@ -1327,33 +1358,52 @@ at::Tensor fused_experts_cpu(
   int num_threads = at::get_num_threads();
   int64_t max_num_tokens_padded = M * topk + E * (BLOCK_M - 1);
   int64_t max_num_blocks = div_up(max_num_tokens_padded, BLOCK_M);
-  auto buffer = at::empty(
-      {max_num_tokens_padded + max_num_blocks + (num_threads + 1) * E + (E + 1) + (max_num_blocks + 1)},
-      topk_ids_.options());
+  const int64_t routing_numel =
+      max_num_tokens_padded + max_num_blocks + (num_threads + 1) * E + (E + 1) + (max_num_blocks + 1);
+  const bool routing_hoisted = routing_buffer.has_value();
+  auto buffer = routing_hoisted ? routing_buffer.value() : at::empty({routing_numel}, topk_ids_.options());
 
   int32_t* __restrict__ sorted_ids = buffer.data_ptr<int32_t>();
   int32_t* __restrict__ expert_ids = sorted_ids + max_num_tokens_padded;
   int32_t* __restrict__ total_cnts = expert_ids + max_num_blocks;
   int32_t* __restrict__ cumsums = total_cnts + (num_threads + 1) * E;
   int32_t* __restrict__ offsets = cumsums + (E + 1);
+  // A caller that already ran moe_routing_prep_cpu can hand the buffer back, which hoists the
+  // whole preamble -- allocation, sentinel fills and the sort -- out of the call. The layout
+  // depends on num_threads, so a buffer built under a different thread count would alias the
+  // wrong sub-arrays; the size check is what catches that.
+  TORCH_CHECK(
+      !routing_hoisted || (buffer.numel() == routing_numel && buffer.scalar_type() == at::kInt),
+      "fused_experts_cpu: routing_buffer must be the int32 buffer moe_routing_prep_cpu returns for this "
+      "M/topk/num_experts at this thread count; expected numel ",
+      routing_numel,
+      " got ",
+      buffer.numel());
 
   // init sorted_ids with `numel` as the padding number
   // init expert_ids with `num_experts`
   int64_t numel = M * topk;
-  at::parallel_for(0, max_num_blocks, GRAIN_SIZE / BLOCK_M, [&](int64_t begin, int64_t end) {
-    int64_t m_start = begin * BLOCK_M;
-    int64_t m_size = std::min((end - begin) * BLOCK_M, max_num_tokens_padded - m_start);
-    fill_stub(sorted_ids + m_start, (int32_t)numel, m_size);
-    fill_stub(expert_ids + begin, (int32_t)E, end - begin);
-  });
-  // zero total_cnts and cumsums
-  at::parallel_for(0, (num_threads + 1) * E + (E + 1), GRAIN_SIZE, [&](int64_t begin, int64_t end) {
-    fill_stub(total_cnts + begin, 0, end - begin);
-  });
+  int64_t num_tokens_post_pad;
+  if (routing_hoisted) {
+    // The buffer already holds the sort, so recover what moe_align_block_size returned:
+    // cumsums[E] is num_tokens_post_pad by construction.
+    num_tokens_post_pad = cumsums[E];
+  } else {
+    at::parallel_for(0, max_num_blocks, GRAIN_SIZE / BLOCK_M, [&](int64_t begin, int64_t end) {
+      int64_t m_start = begin * BLOCK_M;
+      int64_t m_size = std::min((end - begin) * BLOCK_M, max_num_tokens_padded - m_start);
+      fill_stub(sorted_ids + m_start, (int32_t)numel, m_size);
+      fill_stub(expert_ids + begin, (int32_t)E, end - begin);
+    });
+    // zero total_cnts and cumsums
+    at::parallel_for(0, (num_threads + 1) * E + (E + 1), GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+      fill_stub(total_cnts + begin, 0, end - begin);
+    });
 
-  // align experts index
-  int64_t num_tokens_post_pad = moe_align_block_size<BLOCK_M>(
-      sorted_ids, expert_ids, topk_ids_.data_ptr<int32_t>(), total_cnts, cumsums, offsets, E, numel, num_threads);
+    // align experts index
+    num_tokens_post_pad = moe_align_block_size<BLOCK_M>(
+        sorted_ids, expert_ids, topk_ids_.data_ptr<int32_t>(), total_cnts, cumsums, offsets, E, numel, num_threads);
+  }
 
   // unlike triton kernel, we fuse silu with gemm1 so only need 2 intermediate_caches:
   //   1. intermediate_cache1 : [M * topk, N]
@@ -1389,7 +1439,18 @@ at::Tensor fused_experts_cpu(
     // 9. intermediate_cache0 : [M * topk, 2N], gate|up before the activation pass
     buffer_size_nbytes += M * topk * 2 * N * 2;
   }
-  auto buffer2 = at::empty({buffer_size_nbytes}, hidden_states.options().dtype(at::kChar));
+  // A caller can hand in a persistent workspace instead, which hoists this allocation and its
+  // first-touch page faults out of the call. At the realtime decode shapes that at::empty is
+  // most of what the kernel costs, so this is also the shape a real fix would take.
+  TORCH_CHECK(
+      !workspace.has_value() ||
+          (workspace.value().numel() >= buffer_size_nbytes && workspace.value().scalar_type() == at::kChar),
+      "fused_experts_cpu: workspace must be a kChar tensor of at least ",
+      buffer_size_nbytes,
+      " bytes, got ",
+      workspace.has_value() ? workspace.value().numel() : 0);
+  auto buffer2 = workspace.has_value() ? workspace.value()
+                                       : at::empty({buffer_size_nbytes}, hidden_states.options().dtype(at::kChar));
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "fused_experts_kernel_impl", [&] {
     scalar_t* __restrict__ intermediate_cache1 = (scalar_t*)((void*)(buffer2.data_ptr<int8_t>()));
@@ -1590,11 +1651,12 @@ at::Tensor fused_experts_cpu(
       }
 
       // tag dispatch so modes 2 and 3 are separate instantiations and mode 0 keeps its codegen
-      auto run_fused_experts = [&](auto skip_gather_and_reduce_tag, auto skip_scatter_tag) {
+      auto run_fused_experts = [&](auto skip_gather_and_reduce_tag, auto skip_scatter_tag, auto skip_act_tag) {
         fused_experts_kernel_impl<
             scalar_t,
             decltype(skip_gather_and_reduce_tag)::value,
-            decltype(skip_scatter_tag)::value>(
+            decltype(skip_scatter_tag)::value,
+            decltype(skip_act_tag)::value>(
             out_hidden_states.data_ptr<scalar_t>(),
             intermediate_cache1,
             intermediate_cache2,
@@ -1620,13 +1682,15 @@ at::Tensor fused_experts_cpu(
             act_func,
             with_bias);
       };
-      // skip_scatter implies skip_gather_and_reduce, so <false, true> is never instantiated.
-      if (skip_scatter) {
-        run_fused_experts(std::true_type{}, std::true_type{});
+      // Each flag implies the one before it, so only these four instantiations exist.
+      if (skip_activation) {
+        run_fused_experts(std::true_type{}, std::true_type{}, std::true_type{});
+      } else if (skip_scatter) {
+        run_fused_experts(std::true_type{}, std::true_type{}, std::false_type{});
       } else if (skip_gather_and_reduce) {
-        run_fused_experts(std::true_type{}, std::false_type{});
+        run_fused_experts(std::true_type{}, std::false_type{}, std::false_type{});
       } else {
-        run_fused_experts(std::false_type{}, std::false_type{});
+        run_fused_experts(std::false_type{}, std::false_type{}, std::false_type{});
       }
     }
   });

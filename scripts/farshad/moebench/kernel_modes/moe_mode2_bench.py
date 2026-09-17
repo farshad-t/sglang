@@ -140,7 +140,15 @@ def build(num_tokens, counts, seed, ops):
         # single bmm_cpu call over the bucket's experts consumes.
         a = torch.empty((len(ids), c, K), dtype=torch.bfloat16).uniform_(-1, 1, generator=g)
         work.append(dict(c=c, G=len(ids), p1=p1, p2=p2, a=a))
-    return dict(tid=tid, tw=tw, hs=hs, pw1=pw1, pw2=pw2, routed=routed,
+    # Pre-built routing buffer and workspace for the hoisted rungs. The workspace is sized
+    # generously (the kernel only checks >=) and first-touched here, so its page faults are
+    # paid at setup rather than inside the timed call.
+    nthreads = torch.get_num_threads()
+    rbuf = ops.moe_routing_prep_cpu(tid, E) if hasattr(ops, "moe_routing_prep_cpu") else None
+    ws_bytes = 2 * (routed * N * 2 + routed * K * 2 + nthreads * 32 * K * 2 + nthreads * 2 * 32 * 32 * 4)
+    ws = torch.empty(ws_bytes, dtype=torch.int8)
+    ws.view(-1)[::4096] = 1
+    return dict(tid=tid, tw=tw, hs=hs, pw1=pw1, pw2=pw2, routed=routed, rbuf=rbuf, ws=ws,
                 hbuf=hbuf, actbuf=actbuf, ybuf=ybuf, silubuf=silubuf, work=work)
 
 
@@ -154,14 +162,23 @@ def make_rungs(st, ops):
 
     has_mode = "expert_batching_mode" in str(fe.default._schema)
 
-    def fused(mode):
-        args = [st["hs"], st["pw1"], st["pw2"], st["tw"], st["tid"], False, 0,
+    has_hoist = "routing_buffer" in str(fe.default._schema)
+
+    def fused(mode, hoist=False):
+        """hoist=True passes a pre-built routing buffer and workspace, and runs in place, so
+        the routing sort and the per-call at::empty are out of the timed region. Everything
+        else is untouched, which is what makes mode3 - mode3(hoist) their measured cost."""
+        if hoist and (not has_hoist or st["rbuf"] is None):
+            return None
+        args = [st["hs"], st["pw1"], st["pw2"], st["tw"], st["tid"], bool(hoist), 0,
                 None, None, None, None, None, None, None, None, None, True, None]
         # the pristine build predates expert_batching_mode; its schema takes 18 args
         if has_mode:
             args = args + [mode]
         elif mode != 0:
             return None
+        if has_hoist:
+            args = args + ([st["rbuf"], st["ws"]] if hoist else [None, None])
 
         def run():
             fe(*args)
@@ -227,6 +244,12 @@ def make_rungs(st, ops):
              unfused=unfused(), unfused_bare=unfused(alloc=False, prep=False))
     if has_prep:
         r["routing_prep"] = routing_prep
+    # The subtractive ladder: each rung removes ONE more step from the real kernel, so its
+    # cost is measured in situ. Subtracting the standalone `allocfloor` / `routing_prep`
+    # instead would over-count -- at bs1 those two alone already exceed mode0.
+    for name, fn in (("mode3_hoist", fused(3, hoist=True)), ("mode4_hoist", fused(4, hoist=True))):
+        if fn is not None:
+            r[name] = fn
     return r
 
 
