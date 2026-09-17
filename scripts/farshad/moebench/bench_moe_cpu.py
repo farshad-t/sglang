@@ -214,6 +214,14 @@ class FusedExpertsCaller:
         # qwen35-bkc container that sent us down the pybind path, which that build
         # does not have either. Import before looking, tolerate a build with no
         # importable package (the pybind branch reports it properly).
+        # A kernel built out of tree has no installable package: the CMake target is a
+        # bare `common_ops` extension module, and importing it is what runs TORCH_LIBRARY.
+        # Read from the environment rather than from args so a spawned instance inherits
+        # it without the flag being threaded through mp.
+        so_dir = os.environ.get("MOEBENCH_KERNEL_SO_DIR", "")
+        if so_dir:
+            sys.path.insert(0, so_dir)
+            import common_ops  # noqa: F401
         try:
             import sgl_kernel  # noqa: F401
         except Exception:
@@ -548,6 +556,10 @@ def main() -> int:
                         "reference over the projection's per-bucket shapes (NOT the "
                         "projection's cost -- see the module docstring); both = run "
                         "each and report the ratio")
+    p.add_argument("--kernel-so-dir", default=os.environ.get("MOEBENCH_KERNEL_SO_DIR", ""),
+                   help="directory holding a locally built common_ops extension, for a "
+                        "box with no installed sgl-kernel wheel. Importing it is what "
+                        "registers torch.ops.sgl_kernel.")
     p.add_argument("--fused-mode", type=int, default=0, choices=[0, 2],
                    help="fused_experts_cpu's expert_batching_mode. 0 = the shipping "
                         "kernel. 2 = the same GEMMs and SwiGLU with the gather and the "
@@ -662,6 +674,8 @@ def main() -> int:
     # The stats key is always the UNSHARDED model: routing is a property of the model,
     # not of how its experts are split across ranks. Only the kernel shapes shrink.
     model_key = f"{args.hidden_size}-{args.num_experts}-{args.moe_intermediate_size}"
+    if args.kernel_so_dir:
+        os.environ["MOEBENCH_KERNEL_SO_DIR"] = args.kernel_so_dir
     if args.fused_mode and args.check:
         p.error("--check cannot pass under --fused-mode 2: dropping the scatter leaves "
                 "the output unwritten, so it is wrong by construction. Verify the build "
