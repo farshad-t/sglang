@@ -27,16 +27,24 @@ import multiprocessing as mp
 # carry another user's hard-pinned inference schedulers when that server is up.
 FULL = {0: (0, 32), 1: (32, 64), 2: (64, 96)}
 
-E, K, N, TOPK = 256, 2048, 512, 8
+E, K, TOPK = 256, 2048, 8
+N = 512  # per-regime; set by instance() before any build
 
 REGIMES = {
-    # name: (num_tokens, per-expert token counts as {count: n_experts})
-    "decode": (72, {1: 64, 2: 64, 3: 64, 6: 32}),
-    "prefill": (16384, {512: 256}),
-    "prefill_hot": (32768, {32768: 8}),
+    # name: (num_tokens, per-expert token counts as {count: n_experts}, N)
+    "decode": (72, {1: 64, 2: 64, 3: 64, 6: 32}, 512),
+    "prefill": (16384, {512: 256}, 512),
+    "prefill_hot": (32768, {32768: 8}, 512),
     # 8192 tokens/expert across all 256 experts: the "tens of thousands per expert"
     # end WITHOUT concentrating routing onto a handful of experts. ~29 GiB/instance.
-    "prefill_big": (262144, {8192: 256}),
+    "prefill_big": (262144, {8192: 256}, 512),
+    # The four cells run on DMR (224c, SNC OFF, 4x56c), replayed here. rt is TP4, so
+    # N = 512/4; thr is TP1 at the full N. Counts are balanced rather than the run's real
+    # histogram, because the unfused rung needs equal-token buckets to batch a bmm_cpu.
+    "dmr_rt_decode": (1, {1: 8}, 128),
+    "dmr_rt_prefill": (1024, {32: 256}, 128),
+    "dmr_thr_decode": (320, {10: 256}, 512),
+    "dmr_thr_prefill": (327680, {10240: 256}, 512),
 }
 
 
@@ -90,6 +98,12 @@ def build(num_tokens, counts, seed, ops):
     actbuf = torch.empty((routed, N), dtype=torch.bfloat16).uniform_(-1, 1, generator=g)
     ybuf = torch.empty((routed, K), dtype=torch.bfloat16).uniform_(-1, 1, generator=g)
 
+    # fused_experts_cpu repacks w1/w2 on EVERY call unless is_vnni=True, and that repack is
+    # 60-96% of its runtime here -- so pack once at setup and pass is_vnni=True, matching how
+    # the unfused rung gets its weights and how bench_moe_cpu.py's --prepack default runs.
+    pw1 = ops.convert_weight_packed(w1)
+    pw2 = ops.convert_weight_packed(w2)
+
     # w1 is [E, 2N, K] and w2 is [E, K, N] -- both already output-channel-major, which is
     # the layout convert_weight_packed wants, so no transpose here.
     work = []
@@ -103,7 +117,7 @@ def build(num_tokens, counts, seed, ops):
         a_small = torch.empty((gc, c, K), dtype=torch.bfloat16).uniform_(-1, 1, generator=g)
         a_wide = torch.empty((len(ids), c, K), dtype=torch.bfloat16).uniform_(-1, 1, generator=g)
         work.append(dict(c=c, G=len(ids), gc=gc, p1=p1, p2=p2, a_small=a_small, a_wide=a_wide))
-    return dict(tid=tid, tw=tw, hs=hs, w1=w1, w2=w2, routed=routed,
+    return dict(tid=tid, tw=tw, hs=hs, pw1=pw1, pw2=pw2, routed=routed,
                 hbuf=hbuf, actbuf=actbuf, ybuf=ybuf, work=work)
 
 
@@ -116,8 +130,8 @@ def make_rungs(st, ops):
     has_mode = "expert_batching_mode" in str(fe.default._schema)
 
     def fused(mode):
-        args = [st["hs"], st["w1"], st["w2"], st["tw"], st["tid"], False, 0,
-                None, None, None, None, None, None, None, None, None, False, None]
+        args = [st["hs"], st["pw1"], st["pw2"], st["tw"], st["tid"], False, 0,
+                None, None, None, None, None, None, None, None, None, True, None]
         # the pristine build predates expert_batching_mode; its schema takes 18 args
         if has_mode:
             args = args + [mode]
@@ -190,7 +204,8 @@ def instance(idx, cores, barrier, q, a):
     del warm
 
     ops = torch.ops.sgl_kernel
-    num_tokens, counts = REGIMES[a.regime]
+    global N
+    num_tokens, counts, N = REGIMES[a.regime]
     st = build(num_tokens, counts, a.seed + idx, ops)
     rungs = make_rungs(st, ops)
     names = [n for n in a.rungs.split(",") if rungs.get(n) is not None]
@@ -255,7 +270,7 @@ def main():
         pr.join()
 
     m = got[0]["_meta"]
-    print(f"regime={a.regime} K={K} N={N} E={E} topk={TOPK} tokens={m['num_tokens']} "
+    print(f"regime={a.regime} K={K} N={REGIMES[a.regime][2]} E={E} topk={TOPK} tokens={m['num_tokens']} "
           f"routed={m['routed']} tokens_per_expert={m['hist']} "
           f"instances={a.instances}x{m['cores']}c iters={a.iters}")
     print(f"{'rung':14s} {'median ms':>11s} {'min ms':>10s} {'worst/med':>10s}")
