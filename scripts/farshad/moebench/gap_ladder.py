@@ -180,7 +180,10 @@ def make_rungs(groups, mis, copies, seed, hidden, num_tokens):
                 h = torch.empty((nexp, tokens, 2 * N), dtype=torch.bfloat16)
                 ops.bmm_cpu(h, a_of(nexp, tokens), p1, True, None)
                 y = torch.empty((nexp, tokens, K), dtype=torch.bfloat16)
-                ops.bmm_cpu(y, h[:, :, :N].contiguous(), p2, True, None)
+                # h[:, :, :N] is strided; bmm_cpu needs it contiguous, and the unpacked
+                # bmm2 hands torch.bmm the view. Copy the SAME slice the packed second
+                # GEMM will read, so the rung is not paying for a slice bmm2 skips.
+                ops.bmm_cpu(y, h.chunk(2, dim=-1)[0].contiguous(), p2, True, None)
 
         def full_packed():
             for nexp, tokens, p1, p2 in pcur():
@@ -212,9 +215,14 @@ def make_rungs(groups, mis, copies, seed, hidden, num_tokens):
             torch.bmm(F.silu(gate) * up, tiny_w2)
 
     r = dict(bmm2=bmm2, full=full, contig=contig, swiglu=swiglu,
-             gather=gather, scatter=scatter, e2e=e2e, opfloor=opfloor)
-    if packed is not None:
-        r.update(bmm2_packed=bmm2_packed, full_packed=full_packed, e2e_packed=e2e_packed)
+             gather=gather, scatter=scatter, opfloor=opfloor)
+    if packed is None:
+        r["e2e"] = e2e
+    else:
+        # `e2e` is the headline apples-to-apples number, so it takes the DEFAULT weight
+        # layout, which is packed -- the same choice fused_experts_cpu is measured under.
+        r.update(e2e=e2e_packed, e2e_unpacked=e2e, bmm2_packed=bmm2_packed,
+                 full_packed=full_packed)
     return r
 
 
@@ -279,6 +287,12 @@ def main():
     meta = got[0]["_meta"]
     print(f"lane={a.lane} layer={a.layer} buckets={meta['buckets']} copies={meta['copies']} "
           f"mis={meta['mis']} instances={a.instances}x{meta['cores']}c iters={a.iters}")
+    groups, _c, _m, ntok, topk = groups_for(a.results_csv, a.lane, a.layer)
+    slots = sum(n * t for n, t in groups)
+    routed = ntok * topk
+    print(f"routed slots: bucketed={slots} vs exact={routed} -> the bucketed decomposition "
+          f"does {slots/routed:.3f}x the GEMM work fused does (padding to a common token "
+          f"count per bucket); experts covered={sum(n for n, _ in groups)}")
     print(f"{'rung':10s} {'median ms':>11s} {'min ms':>10s} {'imb':>6s}")
     res = {}
     for name in a.rungs.split(","):
