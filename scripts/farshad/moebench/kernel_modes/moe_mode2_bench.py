@@ -145,7 +145,10 @@ def build(num_tokens, counts, seed, ops):
     # paid at setup rather than inside the timed call.
     nthreads = torch.get_num_threads()
     rbuf = ops.moe_routing_prep_cpu(tid, E) if hasattr(ops, "moe_routing_prep_cpu") else None
-    ws_bytes = 2 * (routed * N * 2 + routed * K * 2 + nthreads * 32 * K * 2 + nthreads * 2 * 32 * 32 * 4)
+    # buffer_size_nbytes for bf16: ic1 + ic2 + A_tmp + C_tmp, at BLOCK_M = BLOCK_N = 32, plus a
+    # MiB of slack. A blanket 2x factor would have cost 13 GiB per instance at thr prefill.
+    ws_bytes = (routed * N * 2 + routed * K * 2 + nthreads * 32 * K * 2
+                + nthreads * 2 * 32 * 32 * 4 + (1 << 20))
     ws = torch.empty(ws_bytes, dtype=torch.int8)
     ws.view(-1)[::4096] = 1
     return dict(tid=tid, tw=tw, hs=hs, pw1=pw1, pw2=pw2, routed=routed, rbuf=rbuf, ws=ws,
@@ -247,7 +250,12 @@ def make_rungs(st, ops):
     # The subtractive ladder: each rung removes ONE more step from the real kernel, so its
     # cost is measured in situ. Subtracting the standalone `allocfloor` / `routing_prep`
     # instead would over-count -- at bs1 those two alone already exceed mode0.
-    for name, fn in (("mode3_hoist", fused(3, hoist=True)), ("mode4_hoist", fused(4, hoist=True))):
+    # The whole ladder is also available hoisted, which is the only way to run it at the big
+    # prefill shapes: there the per-call workspace is 13.4 GiB and its page faults are 57% of
+    # mode 0, so the un-hoisted differences are page faults rather than kernel work.
+    for name, fn in (("mode0_hoist", fused(0, hoist=True)),
+                     ("mode2_hoist", fused(2, hoist=True)),
+                     ("mode3_hoist", fused(3, hoist=True))):
         if fn is not None:
             r[name] = fn
     return r

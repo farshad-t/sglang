@@ -412,11 +412,7 @@ void tinygemm_kernel(
 // decomposition does NOT have, since its gemm2 writes straight into a contiguous buffer.
 // So mode 0 - mode 2 prices gather + reduce, mode 2 - mode 3 prices the scatter, and mode 3
 // is the fused kernel reduced to the work the unfused leg actually does.
-template <
-    typename scalar_t,
-    bool kSkipGatherAndReduce = false,
-    bool kSkipScatter = false,
-    bool kSkipActivation = false>
+template <typename scalar_t, bool kSkipGatherAndReduce = false, bool kSkipScatter = false>
 void fused_experts_kernel_impl(
     scalar_t* __restrict__ output,
     scalar_t* __restrict__ ic1,
@@ -458,14 +454,6 @@ void fused_experts_kernel_impl(
 
   int64_t avg_M = std::max(int64_t(1), M * topk / E);
   const bool use_brgemm = can_use_brgemm<scalar_t>(avg_M);
-  if constexpr (kSkipActivation) {
-    // The tinygemm path folds silu into the gemm's own store (tinygemm_kernel_nn2), so there is
-    // no separate activation pass to remove and mode 4 degenerates to mode 3 there.
-    TORCH_WARN_ONCE(
-        !use_brgemm || act_func != CPUActMethod::silu_and_mul,
-        "fused_experts_cpu: expert_batching_mode=4 can only drop the activation on the brgemm "
-        "silu_and_mul path; here it is identical to mode 3.");
-  }
 
   // here we only parallel on half of 2N to fuse silu_and_mul with gemm
   parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
@@ -581,14 +569,7 @@ void fused_experts_kernel_impl(
       const int64_t offset = offsets[mb];
       if (act_func == CPUActMethod::silu_and_mul && use_brgemm) {
         for (int64_t m = 0; m < m_size; ++m) {
-          if constexpr (kSkipActivation) {
-            // Mode 4: store the gate accumulator converted to bf16 and nothing else, so stage 1
-            // is two gemms plus a store -- what benchdnn times for these same shapes. The up
-            // half is still computed; only silu(gate) * up is gone.
-            copy_stub(ic1 + (offset + m) * N + nb * BLOCK_N, C0 + m * BLOCK_N, BLOCK_N);
-          } else {
-            silu_and_mul_stub(ic1 + (offset + m) * N + nb * BLOCK_N, C0 + m * BLOCK_N, C1 + m * BLOCK_N, BLOCK_N);
-          }
+          silu_and_mul_stub(ic1 + (offset + m) * N + nb * BLOCK_N, C0 + m * BLOCK_N, C1 + m * BLOCK_N, BLOCK_N);
         }
       } else if (act_func == CPUActMethod::gelu_and_mul) {
         for (int64_t m = 0; m < m_size; ++m) {
@@ -1208,15 +1189,13 @@ at::Tensor fused_experts_cpu(
     const std::optional<at::Tensor>& workspace) {
   const CPUActMethod act_func = act_method_from_string(activation, alpha.has_value() && limit.has_value());
   TORCH_CHECK(
-      expert_batching_mode >= 0 && expert_batching_mode <= 4,
+      expert_batching_mode >= 0 && expert_batching_mode <= 3,
       "fused_experts_cpu: expert_batching_mode must be 0 (per token block), 1 (batched per expert bucket), "
-      "2 (mode 0 minus the gather and the reduce), 3 (mode 2 minus the topk-weighted scatter) or 4 (mode 3 "
-      "minus the activation), got ",
+      "2 (mode 0 minus the gather and the reduce) or 3 (mode 2 minus the topk-weighted scatter), got ",
       expert_batching_mode);
   bool use_batched_experts = expert_batching_mode == 1;
   bool skip_gather_and_reduce = expert_batching_mode >= 2;
   bool skip_scatter = expert_batching_mode >= 3;
-  bool skip_activation = expert_batching_mode == 4;
   if (skip_gather_and_reduce) {
     TORCH_WARN_ONCE(
         "fused_experts_cpu: expert_batching_mode=2 RETURNS A WRONG RESULT BY DESIGN. It reads a contiguous "
@@ -1236,13 +1215,6 @@ at::Tensor fused_experts_cpu(
         moe_comp_method);
     skip_gather_and_reduce = false;
     skip_scatter = false;
-    skip_activation = false;
-  }
-  if (skip_activation) {
-    TORCH_WARN_ONCE(
-        "fused_experts_cpu: expert_batching_mode=4 is mode 3 with the silu_and_mul pass replaced by a plain "
-        "store of the gate accumulator, so stage 1 is two gemms and a store -- what benchdnn times for these "
-        "shapes. Timing instrument only.");
   }
   if (use_batched_experts && !(moe_comp_method == CPUQuantMethod::BF16)) {
     TORCH_WARN_ONCE(
@@ -1328,7 +1300,6 @@ at::Tensor fused_experts_cpu(
           M);
       skip_gather_and_reduce = false;
       skip_scatter = false;
-      skip_activation = false;
     }
   }
 
@@ -1651,12 +1622,11 @@ at::Tensor fused_experts_cpu(
       }
 
       // tag dispatch so modes 2 and 3 are separate instantiations and mode 0 keeps its codegen
-      auto run_fused_experts = [&](auto skip_gather_and_reduce_tag, auto skip_scatter_tag, auto skip_act_tag) {
+      auto run_fused_experts = [&](auto skip_gather_and_reduce_tag, auto skip_scatter_tag) {
         fused_experts_kernel_impl<
             scalar_t,
             decltype(skip_gather_and_reduce_tag)::value,
-            decltype(skip_scatter_tag)::value,
-            decltype(skip_act_tag)::value>(
+            decltype(skip_scatter_tag)::value>(
             out_hidden_states.data_ptr<scalar_t>(),
             intermediate_cache1,
             intermediate_cache2,
@@ -1682,15 +1652,13 @@ at::Tensor fused_experts_cpu(
             act_func,
             with_bias);
       };
-      // Each flag implies the one before it, so only these four instantiations exist.
-      if (skip_activation) {
-        run_fused_experts(std::true_type{}, std::true_type{}, std::true_type{});
-      } else if (skip_scatter) {
-        run_fused_experts(std::true_type{}, std::true_type{}, std::false_type{});
+      // skip_scatter implies skip_gather_and_reduce, so <false, true> is never instantiated.
+      if (skip_scatter) {
+        run_fused_experts(std::true_type{}, std::true_type{});
       } else if (skip_gather_and_reduce) {
-        run_fused_experts(std::true_type{}, std::false_type{}, std::false_type{});
+        run_fused_experts(std::true_type{}, std::false_type{});
       } else {
-        run_fused_experts(std::false_type{}, std::false_type{}, std::false_type{});
+        run_fused_experts(std::false_type{}, std::false_type{});
       }
     }
   });
