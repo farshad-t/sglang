@@ -1,24 +1,32 @@
 #!/usr/bin/env python3
-"""Price fused_experts_cpu's own gather+scatter, and the unfused GEMM+SwiGLU against it.
+"""Price each thing the fused MoE kernel does that an unfused decomposition does not.
 
-Three rungs, one process, same weights / activation / warmup / iteration count:
+Four rungs, one process, same weights / activation / warmup / iteration count:
 
-    mode0     fused_experts_cpu(expert_batching_mode=0)  -- gather + gemms + scatter
-    mode2     fused_experts_cpu(expert_batching_mode=2)  -- gemms only, wrong result
-    unfused   bmm_cpu + silu(gate)*up + bmm_cpu          -- what mode2 does, separate ops
+    mode0     fused_experts_cpu(expert_batching_mode=0)  -- as it ships
+    mode2     fused_experts_cpu(expert_batching_mode=2)  -- minus gather and reduce
+    mode3     fused_experts_cpu(expert_batching_mode=3)  -- minus the scatter as well
+    unfused   bmm_cpu + silu(gate)*up + bmm_cpu          -- one call per expert bucket
 
-mode0 - mode2  is the fused kernel's own gather + [M,topk,K]->[M,K] reduce.
-unfused/mode2  compares the two matmul implementations with gather/scatter held out.
+    mode0 - mode2   the gather's row copy + the [M,topk,K]->[M,K] topk reduce
+    mode2 - mode3   the topk-weighted scatter: gemm2's permuted store back to routed-slot
+                    order, which mode 2 still pays and the unfused rung never does
+    unfused / mode3 the two matmul implementations with all three terms held out of BOTH
+                    sides -- the only ratio here that is about the matmul alone
 
-Fair-footprint note: mode2 reads its activation out of hidden_states, an [M, K] tensor,
-so the routed rows it streams come from an M*K footprint. A genuine pre-gathered
-[G, t, K] batch would be topk times bigger and would fall out of LLC when mode2's does
-not, so the unfused rung reuses ONE A buffer sized to M*K across chunks of the bucket.
+The unfused rung issues ONE bmm_cpu pair per bucket over all its experts, which is the
+shape set the projection models: its benchdnn cases are `<G>x<tokens>x2048:<G>x2048x1024`,
+one batched matmul per bucket with the batch dim equal to the bucket's expert count. There
+is deliberately no chunked variant -- nothing upstream chunks, so a chunked rung would be
+measuring an implementation nobody has.
+
 Its h / act / y buffers are full [M*topk, *] slabs, matching the fused kernel's ic1/ic2.
-`unfused_wide` is the same rung with the honest full-size A, to show what that costs.
+Its A is the honest pre-gathered [G, tokens, K], which is topk times the [M, K] that mode
+2 and 3 read their activation slices out of -- an asymmetry that stays, because a
+pre-gathered batch is what the unfused route actually holds.
 
 Routing is built with exact per-expert token counts so the unfused rung can batch each
-count into one bmm_cpu call; mode0/mode2 see the identical routing table.
+count into one bmm_cpu call; every fused mode sees the identical routing table.
 """
 import argparse, json, os, statistics, sys, time
 import multiprocessing as mp
@@ -113,10 +121,10 @@ def build(num_tokens, counts, seed, ops):
         sel = torch.tensor(ids, dtype=torch.int64)
         p1 = ops.convert_weight_packed(w1.index_select(0, sel).contiguous())
         p2 = ops.convert_weight_packed(w2.index_select(0, sel).contiguous())
-        gc = max(1, min(len(ids), num_tokens // c))
-        a_small = torch.empty((gc, c, K), dtype=torch.bfloat16).uniform_(-1, 1, generator=g)
-        a_wide = torch.empty((len(ids), c, K), dtype=torch.bfloat16).uniform_(-1, 1, generator=g)
-        work.append(dict(c=c, G=len(ids), gc=gc, p1=p1, p2=p2, a_small=a_small, a_wide=a_wide))
+        # The honest pre-gathered batch: one [G, tokens, K] A per bucket, which is what a
+        # single bmm_cpu call over the bucket's experts consumes.
+        a = torch.empty((len(ids), c, K), dtype=torch.bfloat16).uniform_(-1, 1, generator=g)
+        work.append(dict(c=c, G=len(ids), p1=p1, p2=p2, a=a))
     return dict(tid=tid, tw=tw, hs=hs, pw1=pw1, pw2=pw2, routed=routed,
                 hbuf=hbuf, actbuf=actbuf, ybuf=ybuf, work=work)
 
@@ -142,7 +150,7 @@ def make_rungs(st, ops):
             fe(*args)
         return run
 
-    def unfused(a_key, alloc=False):
+    def unfused(alloc=False):
         def run():
             # alloc=True re-allocates the h/act/y slabs per call, as fused_experts_cpu does
             # with its internal buffer, so the page-fault cost lands on both sides.
@@ -152,23 +160,18 @@ def make_rungs(st, ops):
                 yb = torch.empty((st["routed"], K), dtype=torch.bfloat16)
             else:
                 hb, ab, yb = st["hbuf"], st["actbuf"], st["ybuf"]
+            base = 0
             for wk in st["work"]:
                 c, G, p1, p2 = wk["c"], wk["G"], wk["p1"], wk["p2"]
-                gc = G if a_key == "a_wide" else wk["gc"]
-                a_all = wk[a_key]
-                base = 0
-                for s in range(0, G, gc):
-                    n = min(gc, G - s)
-                    a = a_all[:n] if a_key == "a_small" else a_all[s:s + n]
-                    rows = n * c
-                    h = hb[base:base + rows].view(n, c, 2 * N)
-                    ops.bmm_cpu(h, a, p1[s:s + n], True, None)
-                    gate, up = h.chunk(2, dim=-1)
-                    act = ab[base:base + rows].view(n, c, N)
-                    torch.mul(F.silu(gate), up, out=act)
-                    y = yb[base:base + rows].view(n, c, K)
-                    ops.bmm_cpu(y, act, p2[s:s + n], True, None)
-                    base += rows
+                rows = G * c
+                h = hb[base:base + rows].view(G, c, 2 * N)
+                ops.bmm_cpu(h, wk["a"], p1, True, None)
+                gate, up = h.chunk(2, dim=-1)
+                act = ab[base:base + rows].view(G, c, N)
+                torch.mul(F.silu(gate), up, out=act)
+                y = yb[base:base + rows].view(G, c, K)
+                ops.bmm_cpu(y, act, p2, True, None)
+                base += rows
         return run
 
     # what fused_experts_cpu's own at::empty costs: same byte count, same first touch
@@ -180,9 +183,8 @@ def make_rungs(st, ops):
         b = torch.empty(nbytes, dtype=torch.uint8)
         b.view(-1)[::4096] = 1
 
-    return dict(mode0=fused(0), mode2=fused(2), allocfloor=allocfloor,
-                unfused=unfused("a_small"), unfused_wide=unfused("a_wide"),
-                unfused_alloc=unfused("a_small", alloc=True))
+    return dict(mode0=fused(0), mode2=fused(2), mode3=fused(3), allocfloor=allocfloor,
+                unfused=unfused(), unfused_alloc=unfused(alloc=True))
 
 
 def instance(idx, cores, barrier, q, a):
@@ -250,12 +252,29 @@ def main():
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--iters", type=int, default=9)
     p.add_argument("--seed", type=int, default=4242)
-    p.add_argument("--rungs", default="mode0,mode2,unfused,unfused_wide")
+    p.add_argument("--rungs", default="mode0,mode2,mode3,unfused")
     p.add_argument("--skip-first-core", action="store_true")
     p.add_argument("--interleave", action="store_true")
     p.add_argument("--arena-gib", type=int, default=4)
+    p.add_argument("--malloc-tune", type=int, default=4,
+                   help="GiB; sets MALLOC_MMAP_THRESHOLD_ above the fused kernel's per-call "
+                        "intermediate so it stays on the heap, plus never-trim. 0 disables, "
+                        "which makes the fused rungs measure page faults.")
     p.add_argument("--out-json", default="")
     a = p.parse_args()
+
+    # glibc reads MALLOC_* once at process start, so these have to be set BEFORE the spawn --
+    # putting them in instance() is too late. fused_experts_cpu at::empty's its [M*topk, *]
+    # intermediates on every call (~671 MiB at the prefill shapes); on the defaults a block
+    # that size is mmap'd and munmap'd per call, so each call page-faults the whole slab and
+    # the fused rungs measure page-zeroing instead of the kernel. Keeping the block on the
+    # heap and never trimming is what makes instance()'s arena pre-warm actually hold, and
+    # without it the fused rungs came out 5x slower with allocfloor at 88% of mode0.
+    if a.malloc_tune:
+        os.environ["MALLOC_TRIM_THRESHOLD_"] = "-1"
+        os.environ["MALLOC_MMAP_THRESHOLD_"] = str(a.malloc_tune * 1024 ** 3)
+        os.environ["MALLOC_TOP_PAD_"] = str(1024 ** 3)
+    print("malloc_tune=" + (f"{a.malloc_tune} GiB" if a.malloc_tune else "OFF"))
 
     ctx = mp.get_context("spawn")
     barrier = ctx.Barrier(a.instances)
@@ -282,16 +301,28 @@ def main():
                        imb=max(med) / mm, per_instance=med)
         print(f"{nm:14s} {mm:>11.3f} {res[nm]['min_ms']:>10.3f} {res[nm]['imb']:>10.3f}")
 
-    if "mode0" in res and "mode2" in res:
-        d = res["mode0"]["median_ms"] - res["mode2"]["median_ms"]
-        print(f"\nmode0 - mode2   = {d:>9.3f} ms  "
-              f"({100 * d / res['mode0']['median_ms']:.1f}% of mode0)  "
-              f"-- the fused kernel's own gather + reduce")
-    for nm in ("unfused", "unfused_wide"):
-        if nm in res and "mode2" in res:
-            print(f"{nm:13s} / mode2 = {res[nm]['median_ms'] / res['mode2']['median_ms']:>7.3f}x")
+    m0 = res.get("mode0", {}).get("median_ms")
+    for lo, hi, what in (("mode2", "mode0", "the gather's row copy + the topk reduce"),
+                         ("mode3", "mode2", "the topk-weighted scatter"),
+                         ("mode3", "mode0", "all three, i.e. everything unfused does not do")):
+        if lo in res and hi in res:
+            d = res[hi]["median_ms"] - res[lo]["median_ms"]
+            print(f"\n{hi} - {lo}   = {d:>9.3f} ms  ({100 * d / m0:+.1f}% of mode0)  -- {what}")
+    for nm in ("mode0", "mode2", "mode3"):
+        if "unfused" in res and nm in res:
+            print(f"unfused / {nm} = {res['unfused']['median_ms'] / res[nm]['median_ms']:>7.3f}x"
+                  + ("   <-- the matmul comparison, all three terms out of both sides"
+                     if nm == "mode3" else ""))
+    # An allocation-dominated cell makes every mode difference unattributable, and that is
+    # not visible from the mode numbers themselves -- it has to be said out loud.
+    if "allocfloor" in res and m0:
+        frac = res["allocfloor"]["median_ms"] / m0
+        warn = ("   <-- ALLOCATION-DOMINATED: the fused rungs are timing page faults, not "
+                "the kernel. Do not quote the mode differences." if frac > 0.25 else "")
+        print(f"\nallocfloor / mode0 = {frac:.1%}{warn}")
     if a.out_json:
-        json.dump(dict(regime=a.regime, meta=m, rungs=res), open(a.out_json, "w"), indent=2)
+        json.dump(dict(regime=a.regime, meta=m, malloc_tune=a.malloc_tune, rungs=res),
+                  open(a.out_json, "w"), indent=2)
 
 
 if __name__ == "__main__":

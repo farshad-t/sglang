@@ -404,7 +404,15 @@ void tinygemm_kernel(
 // reduce never runs, so `output` is left uninitialized. Timing instrument only -- the
 // result is wrong on purpose. The gemm tiles are untouched, so the matmul FLOPs match
 // mode 0 exactly; what mode 2 drops is the gather's copy and the reduce's adds.
-template <typename scalar_t, bool kSkipGatherAndReduce = false>
+//
+// kSkipScatter adds the third term, giving expert_batching_mode=3: gemm2's tile is stored
+// CONTIGUOUSLY in sorted order and unweighted, instead of being permuted back to its
+// routed-slot index and multiplied by the topk weight. That permuted weighted store is the
+// scatter, and mode 2 still pays it -- which is exactly the term an unfused per-bucket
+// decomposition does NOT have, since its gemm2 writes straight into a contiguous buffer.
+// So mode 0 - mode 2 prices gather + reduce, mode 2 - mode 3 prices the scatter, and mode 3
+// is the fused kernel reduced to the work the unfused leg actually does.
+template <typename scalar_t, bool kSkipGatherAndReduce = false, bool kSkipScatter = false>
 void fused_experts_kernel_impl(
     scalar_t* __restrict__ output,
     scalar_t* __restrict__ ic1,
@@ -644,10 +652,24 @@ void fused_experts_kernel_impl(
       }
       // 2.b copy from C to ic2 in original order
       //   and also mul topk_weights in float32
-      for (int64_t m = 0; m < m_size; ++m) {
-        int32_t index = A_ids[m];
-        float weight = topk_weights[index];
-        copy_mul_stub(ic2 + index * K + nb * BLOCK_N, C + m * BLOCK_N, weight, n_size);
+      if constexpr (kSkipScatter) {
+        // Mode 3: contiguous, sorted-order, unweighted store -- what an unfused per-bucket
+        // decomposition does with its gemm2 output. Same byte count and same float->bf16
+        // conversion as the branch below; what is gone is the permutation and the weight.
+        // offsets[mb] counts PADDED routed rows and so overruns ic2's M * topk, and m_size
+        // <= M <= M * topk, so wrapping keeps the slice in bounds the way mode 2's
+        // activation slice does.
+        const int64_t slots = M * topk;
+        const int64_t dst = offsets[mb] % (slots - m_size + 1);
+        for (int64_t m = 0; m < m_size; ++m) {
+          copy_stub(ic2 + (dst + m) * K + nb * BLOCK_N, C + m * BLOCK_N, n_size);
+        }
+      } else {
+        for (int64_t m = 0; m < m_size; ++m) {
+          int32_t index = A_ids[m];
+          float weight = topk_weights[index];
+          copy_mul_stub(ic2 + index * K + nb * BLOCK_N, C + m * BLOCK_N, weight, n_size);
+        }
       }
     });
 
@@ -1122,24 +1144,32 @@ at::Tensor fused_experts_cpu(
     int64_t expert_batching_mode) {
   const CPUActMethod act_func = act_method_from_string(activation, alpha.has_value() && limit.has_value());
   TORCH_CHECK(
-      expert_batching_mode == 0 || expert_batching_mode == 1 || expert_batching_mode == 2,
-      "fused_experts_cpu: expert_batching_mode must be 0 (per token block), 1 (batched per expert bucket) or "
-      "2 (mode 0 minus the gather and the reduce), got ",
+      expert_batching_mode >= 0 && expert_batching_mode <= 3,
+      "fused_experts_cpu: expert_batching_mode must be 0 (per token block), 1 (batched per expert bucket), "
+      "2 (mode 0 minus the gather and the reduce) or 3 (mode 2 minus the topk-weighted scatter), got ",
       expert_batching_mode);
   bool use_batched_experts = expert_batching_mode == 1;
-  bool skip_gather_and_reduce = expert_batching_mode == 2;
+  bool skip_gather_and_reduce = expert_batching_mode == 2 || expert_batching_mode == 3;
+  bool skip_scatter = expert_batching_mode == 3;
   if (skip_gather_and_reduce) {
     TORCH_WARN_ONCE(
         "fused_experts_cpu: expert_batching_mode=2 RETURNS A WRONG RESULT BY DESIGN. It reads a contiguous "
         "activation slice instead of the routed rows and never reduces [M, topk, K] to [M, K], so the output "
         "tensor is left uninitialized. It exists only to time the gemms with gather and scatter priced out.");
   }
+  if (skip_scatter) {
+    TORCH_WARN_ONCE(
+        "fused_experts_cpu: expert_batching_mode=3 is mode 2 plus a contiguous unweighted gemm2 store, so it "
+        "drops the topk-weighted scatter as well. Also a timing instrument: `output` is uninitialized and ic2 "
+        "holds unweighted tiles in sorted order.");
+  }
   if (skip_gather_and_reduce && !(moe_comp_method == CPUQuantMethod::BF16)) {
     TORCH_WARN_ONCE(
-        "fused_experts_cpu: expert_batching_mode=2 is implemented for bf16/fp16 weights only, "
+        "fused_experts_cpu: expert_batching_mode=2/3 is implemented for bf16/fp16 weights only, "
         "falling back to mode 0 for moe_comp_method=",
         moe_comp_method);
     skip_gather_and_reduce = false;
+    skip_scatter = false;
   }
   if (use_batched_experts && !(moe_comp_method == CPUQuantMethod::BF16)) {
     TORCH_WARN_ONCE(
@@ -1220,10 +1250,11 @@ at::Tensor fused_experts_cpu(
     }
     if (!distinct) {
       TORCH_WARN_ONCE(
-          "fused_experts_cpu: expert_batching_mode=2 with M < block_size_m() needs topk_ids "
+          "fused_experts_cpu: expert_batching_mode=2/3 with M < block_size_m() needs topk_ids "
           "distinct per row, falling back to mode 0 for M=",
           M);
       skip_gather_and_reduce = false;
+      skip_scatter = false;
     }
   }
 
@@ -1515,9 +1546,12 @@ at::Tensor fused_experts_cpu(
         return;
       }
 
-      // tag dispatch so mode 2 is a separate instantiation and mode 0 keeps its codegen
-      auto run_fused_experts = [&](auto skip_gather_and_reduce_tag) {
-        fused_experts_kernel_impl<scalar_t, decltype(skip_gather_and_reduce_tag)::value>(
+      // tag dispatch so modes 2 and 3 are separate instantiations and mode 0 keeps its codegen
+      auto run_fused_experts = [&](auto skip_gather_and_reduce_tag, auto skip_scatter_tag) {
+        fused_experts_kernel_impl<
+            scalar_t,
+            decltype(skip_gather_and_reduce_tag)::value,
+            decltype(skip_scatter_tag)::value>(
             out_hidden_states.data_ptr<scalar_t>(),
             intermediate_cache1,
             intermediate_cache2,
@@ -1543,10 +1577,13 @@ at::Tensor fused_experts_cpu(
             act_func,
             with_bias);
       };
-      if (skip_gather_and_reduce) {
-        run_fused_experts(std::true_type{});
+      // skip_scatter implies skip_gather_and_reduce, so <false, true> is never instantiated.
+      if (skip_scatter) {
+        run_fused_experts(std::true_type{}, std::true_type{});
+      } else if (skip_gather_and_reduce) {
+        run_fused_experts(std::true_type{}, std::false_type{});
       } else {
-        run_fused_experts(std::false_type{});
+        run_fused_experts(std::false_type{}, std::false_type{});
       }
     }
   });
