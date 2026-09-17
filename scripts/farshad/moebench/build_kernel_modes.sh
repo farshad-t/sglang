@@ -36,6 +36,11 @@ echo "torch $TV  ->  -DCMAKE_CXX_STANDARD=$STD"
 echo "Torch_DIR=$TD"
 echo "src=$SRC  build=$B  j=$J"
 
+# A box that has built this kernel before usually has cmake and ninja as pip wheels inside
+# the run interpreter's own env, where they are on no PATH until it is activated.
+PATH="$(cd "$(dirname "$PY")" && pwd):$PATH"
+export PATH
+
 if ! command -v cmake >/dev/null || ! command -v ninja >/dev/null; then
   T=/tmp/kbuildtools
   echo "cmake/ninja missing on this box; installing them into $T (a scratch venv, so the"
