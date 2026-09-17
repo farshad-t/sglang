@@ -1,7 +1,11 @@
 cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
 project(sgl_kernel)
 
-set(CMAKE_CXX_STANDARD 17)
+# Torch 2.14's ATen headers require C++20, older ones compile at 17, and the
+# standard has to be settable from outside to build against either.
+if(NOT DEFINED CMAKE_CXX_STANDARD)
+  set(CMAKE_CXX_STANDARD 17)
+endif()
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
