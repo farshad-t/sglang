@@ -20,17 +20,29 @@ It measures two things from one histogram:
   --mode batched   the same shapes as torch batched GEMMs, one bmm per bucket.
                    Same FLOPs. A REFERENCE IMPLEMENTATION, not the projection's cost.
 
+`--mode fused` runs whichever `--fused-mode` was asked for. Mode 0 is the shipping
+kernel: gather the routed rows, two GEMMs with SwiGLU folded into the accumulator, then
+a topk-weighted scatter back. Mode 2 is the same GEMMs and the same SwiGLU with the
+gather and the scatter DROPPED, which is what `--mode batched` does, so mode 2 and the
+batched leg are the pair that isolates matmul quality -- and mode 0 minus mode 2 is what
+the kernel's own gather and reduce cost. Mode 2's output is wrong by construction, so
+`--check` is refused with it and every mode-2 row is timing only.
+
 The batched leg carries the projection's SHAPE SET and NOT its cost model, so a
-fused/batched ratio is not projection error. archbench charges ideal_ops divided by
-a measured efficiency, and those eff sources (kfw-onednn + bdnn_silic) hold benchdnn
-oneDNN runs of these exact bucket shapes: summed over the 27 buckets of the qwen35
-thr-decode cell at LAYER 0 they come to 6.23 ms against a measured fused 6.36 ms,
-1.02x, while this leg's torch.bmm takes 68 ms. That 10.7x is PyTorch per-call overhead
-at tiny M -- 1..159 tokens per expert over 54 bmm calls, 8% of DDR peak and 0.2% of AMX
-peak. (Other layers of the same cell run 26-36 buckets, so the call count varies.)
-bf16 bmm does dispatch to oneDNN AMX brgemm, so it is not an ISA difference. Compare
-a fused measurement against the eff-source row or a projection result dir; use this
-leg only to say what an unoptimised decomposition costs.
+fused/batched ratio is not projection error. archbench charges ideal_ops divided by a
+measured efficiency, and those eff sources (kfw-onednn + bdnn_silic) hold benchdnn
+oneDNN runs of these exact bucket shapes -- so the eff-source row, not this leg, is
+what a projection charges. Compare a fused measurement against that row or against a
+projection result dir; use this leg only to say what an unoptimised decomposition
+costs.
+
+bf16 bmm dispatches to oneDNN AMX brgemm, so a fused/batched gap is kernel quality at
+these shapes and not an ISA difference. The gap moves with M, and reverses: the qwen35
+thr-decode cell runs 26-36 buckets per layer over 1..159 tokens per expert (54 bmm
+calls at LAYER 0), where per-call overhead dominates and the fused kernel wins, while
+thr prefill feeds each bucket tens of thousands of tokens and bmm wins instead. Read
+both legs' times out of a results CSV; no timing is quoted here, because a number in a
+docstring cannot be re-measured.
 
 bf16 only, by design: this is the numeric the projection covers here, and the
 design/test box has no AMX-fp8.
@@ -181,14 +193,20 @@ class FusedExpertsCaller:
             "use_fp8_w8a16": False,
             "is_vnni": self.prepack,
             "activation": self.activation,
+            # 0 = the shipping path; 2 = the same GEMMs with the gather and the
+            # topk-weighted reduce dropped. Only a build carrying the batched-expert
+            # mode has this argument, and a build without it takes its schema default.
+            "expert_batching_mode": self.expert_batching_mode,
         }
 
-    def __init__(self, prepack: bool, inplace: bool, activation: str):
+    def __init__(self, prepack: bool, inplace: bool, activation: str,
+                 expert_batching_mode: int = 0):
         import torch
         self.torch = torch
         self.prepack = prepack
         self.inplace = inplace
         self.activation = activation
+        self.expert_batching_mode = expert_batching_mode
 
         self.kind = None
         # TORCH_LIBRARY registration runs at `import sgl_kernel`, so probing
@@ -229,6 +247,14 @@ class FusedExpertsCaller:
         if prepack and self.pack is None:
             raise RuntimeError("prepacking requested but convert_weight_packed is not "
                                "available in this build (pass --no-prepack)")
+        # Bind-by-name silently drops an argument the build does not declare, which for
+        # this one would measure mode 0 under a mode-2 label -- the exact confusion the
+        # whole comparison exists to avoid. Refuse instead.
+        if expert_batching_mode and "expert_batching_mode" not in self.arg_names:
+            raise RuntimeError(
+                f"--fused-mode {expert_batching_mode} needs a build whose "
+                f"fused_experts_cpu takes `expert_batching_mode`; this one does not, so "
+                f"the call would run mode 0. Schema:\n  {self.schema}")
 
     def prepack_weight(self, w):
         return self.pack(w) if self.prepack else w
@@ -351,11 +377,11 @@ def make_fused_runner(counts, num_tokens, model, caller, seed, copies: int = 1,
     multiplies, and a clone is one memcpy where a randn is a fp32 draw plus a cast.
 
     `acts` is ONE activation buffer shared by every cell of the leg, exactly as the
-    batched leg already shares one (make_batched_runner). Without it each cell held its
-    own [num_tokens, K]: at thr prefill that is 1.5 GiB x 40 layers = 60 GiB, half the
-    fused pool, and it made the FUSED leg 1.85x the batched one -- so the leg that has
-    to fit was the one that did not. Every cell of a layer sweep routes within ~2% of
-    the same token count, and a real rank re-reads one activation buffer at every layer,
+    batched leg already shares one (make_batched_runner). A per-cell [num_tokens, K]
+    instead costs 1.5 GiB x 40 layers = 60 GiB at thr prefill, half the fused pool
+    again, which is what put the leg that has to fit over the memory guard. Every cell
+    of a layer sweep routes within ~2% of the same token count, and a real rank
+    re-reads one activation buffer at every layer,
     so one buffer sized to the largest cell is the faithful shape as well as the cheap
     one. NOTE this makes the fused leg's ACTIVATION reads cache-resident across cells,
     the same way the batched leg's already are -- the weights, which is what --copies
@@ -522,6 +548,13 @@ def main() -> int:
                         "reference over the projection's per-bucket shapes (NOT the "
                         "projection's cost -- see the module docstring); both = run "
                         "each and report the ratio")
+    p.add_argument("--fused-mode", type=int, default=0, choices=[0, 2],
+                   help="fused_experts_cpu's expert_batching_mode. 0 = the shipping "
+                        "kernel. 2 = the same GEMMs and SwiGLU with the gather and the "
+                        "topk-weighted reduce dropped, so it does what --mode batched "
+                        "does and the two are comparable; its OUTPUT IS WRONG BY "
+                        "CONSTRUCTION and it is for timing only. Needs a build carrying "
+                        "the argument, and --check is refused with it.")
     archbench_stats.add_args(p)
     p.add_argument("--decode-csv", default=None, help="override the decode stats CSV "
                                                       "with a local file")
@@ -629,6 +662,10 @@ def main() -> int:
     # The stats key is always the UNSHARDED model: routing is a property of the model,
     # not of how its experts are split across ranks. Only the kernel shapes shrink.
     model_key = f"{args.hidden_size}-{args.num_experts}-{args.moe_intermediate_size}"
+    if args.fused_mode and args.check:
+        p.error("--check cannot pass under --fused-mode 2: dropping the scatter leaves "
+                "the output unwritten, so it is wrong by construction. Verify the build "
+                "once at --fused-mode 0, then time mode 2.")
     if args.moe_intermediate_size % args.tp:
         p.error(f"--tp {args.tp} does not divide moe_intermediate_size "
                 f"{args.moe_intermediate_size}")
@@ -819,8 +856,12 @@ def run_cells(args, model, model_key, barrier=None, tag_prefix="") -> List[Dict]
         print(f"torch {torch.__version__}  threads={torch.get_num_threads()}")
         if args.mode in ("fused", "both"):
             caller = FusedExpertsCaller(prepack=not args.no_prepack, inplace=args.inplace,
-                                        activation=args.activation)
+                                        activation=args.activation,
+                                        expert_batching_mode=args.fused_mode)
             print(f"kernel schema: {caller.describe()}")
+            print(f"fused mode: {args.fused_mode}"
+                  + ("  (gather and topk-weighted reduce DROPPED; output is wrong by "
+                     "construction, timing only)" if args.fused_mode else ""))
 
     print(f"stats: {provenance}")
     print(f"       commit {stats_commit or '(local file, unversioned)'}")
@@ -1025,6 +1066,10 @@ def prepare_cell(args, model, model_key, batch: int, layer: int, csv_file: str,
                copies=args.copies, instances=args.instances,
                cores_per_instance=args.cores_per_instance or 0,
                label=args.label or "",
+               # Which fused path the fused_* columns came from. A join must key on this
+               # column and not on a label suffix: two rows whose only difference is the
+               # gather/scatter are otherwise indistinguishable after the fact.
+               fused_mode=args.fused_mode,
                num_groups=len(groups), active_experts=active,
                histogram_mass=mass, routed_tokens=R, slack=slack,
                num_tokens=num_tokens, gflop=flops / 1e9,
@@ -1059,6 +1104,7 @@ RESULT_FIELDS: List[str] = [
     # Appended after the original set: `write_rows` reconciles against a header already
     # on disk, so an older CSV without these columns still accepts new rows.
     "copies", "instances", "cores_per_instance", "label",
+    "fused_mode",
 ]
 
 

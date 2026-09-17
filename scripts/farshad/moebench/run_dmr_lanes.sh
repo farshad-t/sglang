@@ -71,6 +71,13 @@
 #                        as separate sweeps costs one extra pool build per lane but keeps
 #                        only one leg's weights resident, and it means a failure in the
 #                        second leg cannot cost you the first leg's numbers.
+#   FUSED_MODE=0|2       fused_experts_cpu's expert_batching_mode for the whole sweep.
+#                        2 drops the gather and the topk-weighted reduce, so
+#                        `MODE=fused FUSED_MODE=2` measures the same work `MODE=batched`
+#                        does and the two become comparable, while mode 0 minus mode 2 is
+#                        what the kernel's own gather and reduce cost. Lane names get an
+#                        `_m2` suffix, and --check is dropped because mode 2's output is
+#                        wrong by construction. Needs a build carrying the argument.
 #   AB="..."             extra stats-source flags, e.g. AB="--ab-offline"
 #   PY=python3           interpreter (used when IMG is empty)
 #   IMG=<image>          run each cell inside this container instead of on the metal.
@@ -103,6 +110,7 @@ LAYERS=${LAYERS:-all}
 MAXOTHER_CPU=${MAXOTHER_CPU:-200}
 AB=${AB:-}
 MODE=${MODE:-}
+FUSED_MODE=${FUSED_MODE:-}
 PY=${PY:-python3}
 IMG=${IMG:-}
 HOSTROOT=${HOSTROOT:-/home/farshad/moebench}
@@ -273,15 +281,14 @@ if [ "$FORCE" != "1" ]; then
 fi
 
 # ---- one cell, N concurrent pinned instances ----------------------------------
-# The concurrency now lives INSIDE bench_moe_cpu.py (--instances), not in this shell.
-# The shell version launched independent processes that started together and then
-# drifted apart, so a cell could be timed while its neighbours sat between kernels --
-# which measured a partly-idle socket and produced a 2.28x across-instance spread.
-# The Python driver re-synchronises all instances on a barrier before EVERY iteration
-# and sets OMP_WAIT_POLICY=active / KMP_BLOCKTIME=200 so idle threads BUSY-WAIT: with the
-# barrier holding the instances in step their idle windows are short and aligned, while
-# sleeping cost a wake-up on every call (0.093 ms -> 5.0 ms on decode bs1 TP4, 54x).
-# Measured imbalance after: ~1.07x median.
+# The concurrency lives INSIDE bench_moe_cpu.py (--instances), not in this shell, because
+# instances that merely start together drift apart within a few iterations and a cell can
+# then be timed while its neighbours sit between kernels -- measuring a partly-idle
+# socket. The Python driver re-synchronises all instances on a barrier before EVERY
+# iteration and sets OMP_WAIT_POLICY=active / KMP_BLOCKTIME=200 so idle threads BUSY-WAIT:
+# the barrier keeps their idle windows short and aligned, where sleeping costs a wake-up
+# on every kernel call. Each sweep prints its own across-instance imbalance; the routed
+# lanes run near 1.01x median.
 spread() {  # spread <name> <n_instances> <cores_per_instance> <args...>
   local name=$1 n=$2 cores=$3; shift 3
   # MODE, when set, replaces whatever --mode the lane asked for. A lane written as
@@ -296,6 +303,19 @@ spread() {  # spread <name> <n_instances> <cores_per_instance> <args...>
     done
     set -- "${a[@]}" --mode "$MODE"
     name="${name}_${MODE}"
+  fi
+  # FUSED_MODE picks fused_experts_cpu's expert_batching_mode for this whole sweep, the
+  # same way MODE picks the leg: mode 2 drops the gather and the topk-weighted reduce, so
+  # `MODE=fused FUSED_MODE=2` is the sweep that pairs with `MODE=batched`. It also strips
+  # --check, which the driver refuses under mode 2 because the output is unwritten.
+  if [ -n "$FUSED_MODE" ] && [ "$FUSED_MODE" != 0 ]; then
+    local b=()
+    for x in "$@"; do
+      if [ "$x" = "--check" ]; then continue; fi
+      b+=("$x")
+    done
+    set -- "${b[@]}" --fused-mode "$FUSED_MODE"
+    name="${name}_m${FUSED_MODE}"
   fi
   echo
   echo "################ $name   (${n} x ${cores}c concurrent, barrier-synced)"
