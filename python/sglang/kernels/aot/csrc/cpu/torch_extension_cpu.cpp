@@ -277,6 +277,10 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
 // weight prepack
 at::Tensor convert_weight_packed(at::Tensor& weight);
 
+// the routing sort fused_experts_cpu does before any gemm, exposed so an unfused route
+// can be charged the identical step
+at::Tensor moe_routing_prep_cpu(at::Tensor& topk_ids, int64_t num_experts);
+
 // scale prepack for mxfp4
 at::Tensor convert_scale_packed(at::Tensor& scale);
 
@@ -738,6 +742,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("chunk_gated_delta_rule_cpu", torch::kCPU, &chunk_gated_delta_rule_cpu);
 
   // weight prepack
+  m.def("moe_routing_prep_cpu(Tensor topk_ids, int num_experts) -> Tensor");
+  m.impl("moe_routing_prep_cpu", torch::kCPU, &moe_routing_prep_cpu);
+
   m.def("convert_weight_packed(Tensor weight) -> Tensor");
   m.impl("convert_weight_packed", torch::kCPU, &convert_weight_packed);
 

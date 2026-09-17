@@ -1119,6 +1119,49 @@ static inline void check_moe_scales(
 // w1: [E, 2N, K] or [E, 2N, K / 2] for uint8
 // w2: [E, K, N] or [E, K, N / 2] for uint8
 // topk_weights: [M, topk]
+// The routing bookkeeping fused_experts_cpu does before any gemm runs: allocate the sort
+// buffer, seed the padding sentinels, and group the routed slots by expert. Exposed as its
+// own op so a decomposed route can be charged the SAME step -- an unfused implementation
+// has to group tokens by expert too, and a harness that precomputes its buckets at setup is
+// skipping work the real route cannot skip. Byte-for-byte the preamble below, so the two
+// sides pay one identical cost that cancels in their ratio.
+//
+// Returns the buffer, which is what keeps the whole thing from being optimised away.
+at::Tensor moe_routing_prep_cpu(at::Tensor& topk_ids, int64_t num_experts) {
+  constexpr int64_t BLOCK_M = block_size_m();
+  const auto topk_ids_ = topk_ids.to(at::kInt);
+  int64_t M = topk_ids_.size(0);
+  int64_t topk = topk_ids_.size(1);
+  int64_t E = num_experts;
+  int num_threads = at::get_num_threads();
+  int64_t max_num_tokens_padded = M * topk + E * (BLOCK_M - 1);
+  int64_t max_num_blocks = div_up(max_num_tokens_padded, BLOCK_M);
+  auto buffer = at::empty(
+      {max_num_tokens_padded + max_num_blocks + (num_threads + 1) * E + (E + 1) + (max_num_blocks + 1)},
+      topk_ids_.options());
+
+  int32_t* __restrict__ sorted_ids = buffer.data_ptr<int32_t>();
+  int32_t* __restrict__ expert_ids = sorted_ids + max_num_tokens_padded;
+  int32_t* __restrict__ total_cnts = expert_ids + max_num_blocks;
+  int32_t* __restrict__ cumsums = total_cnts + (num_threads + 1) * E;
+  int32_t* __restrict__ offsets = cumsums + (E + 1);
+
+  int64_t numel = M * topk;
+  at::parallel_for(0, max_num_blocks, GRAIN_SIZE / BLOCK_M, [&](int64_t begin, int64_t end) {
+    int64_t m_start = begin * BLOCK_M;
+    int64_t m_size = std::min((end - begin) * BLOCK_M, max_num_tokens_padded - m_start);
+    fill_stub(sorted_ids + m_start, (int32_t)numel, m_size);
+    fill_stub(expert_ids + begin, (int32_t)E, end - begin);
+  });
+  at::parallel_for(0, (num_threads + 1) * E + (E + 1), GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+    fill_stub(total_cnts + begin, 0, end - begin);
+  });
+
+  moe_align_block_size<BLOCK_M>(
+      sorted_ids, expert_ids, topk_ids_.data_ptr<int32_t>(), total_cnts, cumsums, offsets, E, numel, num_threads);
+  return buffer;
+}
+
 // topk_ids: [M, topk] (int32_t)
 //
 

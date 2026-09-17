@@ -1,18 +1,32 @@
 #!/usr/bin/env python3
 """Price each thing the fused MoE kernel does that an unfused decomposition does not.
 
-Four rungs, one process, same weights / activation / warmup / iteration count:
+One process, same weights / activation / warmup / iteration count:
 
     mode0     fused_experts_cpu(expert_batching_mode=0)  -- as it ships
     mode2     fused_experts_cpu(expert_batching_mode=2)  -- minus gather and reduce
     mode3     fused_experts_cpu(expert_batching_mode=3)  -- minus the scatter as well
-    unfused   bmm_cpu + silu(gate)*up + bmm_cpu          -- one call per expert bucket
+    unfused   routing prep + per-call alloc + bmm_cpu + silu(gate)*up + bmm_cpu
+    unfused_bare   the same without the routing prep or the per-call alloc
 
     mode0 - mode2   the gather's row copy + the [M,topk,K]->[M,K] topk reduce
     mode2 - mode3   the topk-weighted scatter: gemm2's permuted store back to routed-slot
                     order, which mode 2 still pays and the unfused rung never does
-    unfused / mode3 the two matmul implementations with all three terms held out of BOTH
-                    sides -- the only ratio here that is about the matmul alone
+    unfused / mode3 the two implementations with every term that is not the matmul or the
+                    activation fusion held out of, or charged to, BOTH sides
+
+Two steps used to sit on the fused side only, and both are now on the unfused rung as well:
+the routing sort (`moe_routing_prep_cpu`, the identical function fused_experts_cpu calls --
+the harness's precomputed buckets are a shortcut a real unfused route does not get), and the
+per-call allocation of the intermediates plus a block matching out_hidden_states and the
+thread scratch, first-touched, since what that costs is page faults and not the malloc.
+`allocfloor` and `routing_prep` price those two on their own; `unfused_bare` shows the leg
+without them.
+
+What is left on one side only is the SwiGLU fusion, deliberately: the fused kernel keeps
+gate|up in its fp32 accumulator and stores bf16 straight out of `silu_and_mul_stub`, where
+the decomposition has to materialise `h` and read it back. That is a real property of the
+two implementations, so it stays counted.
 
 The unfused rung issues ONE bmm_cpu pair per bucket over all its experts, which is the
 shape set the projection models: its benchdnn cases are `<G>x<tokens>x2048:<G>x2048x1024`,
@@ -105,6 +119,7 @@ def build(num_tokens, counts, seed, ops):
     hbuf = torch.empty((routed, 2 * N), dtype=torch.bfloat16).uniform_(-1, 1, generator=g)
     actbuf = torch.empty((routed, N), dtype=torch.bfloat16).uniform_(-1, 1, generator=g)
     ybuf = torch.empty((routed, K), dtype=torch.bfloat16).uniform_(-1, 1, generator=g)
+    silubuf = torch.empty((routed, N), dtype=torch.bfloat16).uniform_(-1, 1, generator=g)
 
     # fused_experts_cpu repacks w1/w2 on EVERY call unless is_vnni=True, and that repack is
     # 60-96% of its runtime here -- so pack once at setup and pass is_vnni=True, matching how
@@ -126,7 +141,7 @@ def build(num_tokens, counts, seed, ops):
         a = torch.empty((len(ids), c, K), dtype=torch.bfloat16).uniform_(-1, 1, generator=g)
         work.append(dict(c=c, G=len(ids), p1=p1, p2=p2, a=a))
     return dict(tid=tid, tw=tw, hs=hs, pw1=pw1, pw2=pw2, routed=routed,
-                hbuf=hbuf, actbuf=actbuf, ybuf=ybuf, work=work)
+                hbuf=hbuf, actbuf=actbuf, ybuf=ybuf, silubuf=silubuf, work=work)
 
 
 def make_rungs(st, ops):
@@ -134,6 +149,8 @@ def make_rungs(st, ops):
     import torch.nn.functional as F
 
     fe = torch.ops.sgl_kernel.fused_experts_cpu
+    M = st["hs"].size(0)
+    nthreads = torch.get_num_threads()
 
     has_mode = "expert_batching_mode" in str(fe.default._schema)
 
@@ -150,16 +167,33 @@ def make_rungs(st, ops):
             fe(*args)
         return run
 
-    def unfused(alloc=False):
+    has_prep = hasattr(ops, "moe_routing_prep_cpu")
+    # fused_experts_cpu allocates out_hidden_states plus the thread scratch (A_tmp, C_tmp)
+    # that ic1/ic2 do not correspond to; charging the unfused side an equal-sized block, and
+    # FIRST TOUCHING it, is what makes the two pay the same page-fault work. The cost is the
+    # faults, not the malloc, so an untouched torch.empty would be free and match nothing.
+    extra_bytes = M * K * 2 + nthreads * 32 * K * 2 + nthreads * 2 * 32 * 32 * 4
+
+    def unfused(alloc=True, prep=True):
+        """The decomposition, charged the two steps only the fused side used to pay.
+
+        `prep` runs the SAME routing sort fused_experts_cpu runs; the harness's buckets are
+        precomputed at setup, which a real unfused route could not do. `alloc` allocates the
+        intermediates per call instead of reusing setup buffers, as fused_experts_cpu does.
+        Both default ON: with them the two legs' op lists differ only in the SwiGLU fusion.
+        """
         def run():
-            # alloc=True re-allocates the h/act/y slabs per call, as fused_experts_cpu does
-            # with its internal buffer, so the page-fault cost lands on both sides.
+            if prep and has_prep:
+                ops.moe_routing_prep_cpu(st["tid"], E)
             if alloc:
                 hb = torch.empty((st["routed"], 2 * N), dtype=torch.bfloat16)
                 ab = torch.empty((st["routed"], N), dtype=torch.bfloat16)
                 yb = torch.empty((st["routed"], K), dtype=torch.bfloat16)
+                sb = torch.empty((st["routed"], N), dtype=torch.bfloat16)
+                extra = torch.empty(extra_bytes, dtype=torch.uint8)
+                extra.view(-1)[::4096] = 1
             else:
-                hb, ab, yb = st["hbuf"], st["actbuf"], st["ybuf"]
+                hb, ab, yb, sb = st["hbuf"], st["actbuf"], st["ybuf"], st["silubuf"]
             base = 0
             for wk in st["work"]:
                 c, G, p1, p2 = wk["c"], wk["G"], wk["p1"], wk["p2"]
@@ -168,23 +202,32 @@ def make_rungs(st, ops):
                 ops.bmm_cpu(h, wk["a"], p1, True, None)
                 gate, up = h.chunk(2, dim=-1)
                 act = ab[base:base + rows].view(G, c, N)
-                torch.mul(F.silu(gate), up, out=act)
+                # silu(gate) * up without F.silu's per-call temporary: that temporary was an
+                # allocation inside the timed loop that the fused side does not have.
+                s = sb[base:base + rows].view(G, c, N)
+                torch.sigmoid(gate, out=s)
+                s.mul_(gate)
+                torch.mul(s, up, out=act)
                 y = yb[base:base + rows].view(G, c, K)
                 ops.bmm_cpu(y, act, p2, True, None)
                 base += rows
         return run
 
     # what fused_experts_cpu's own at::empty costs: same byte count, same first touch
-    nbytes = st["routed"] * N * 2 + st["routed"] * K * 2
-    nthreads = torch.get_num_threads()
-    nbytes += nthreads * 32 * K * 2 + nthreads * 2 * 32 * 32 * 4
+    nbytes = st["routed"] * N * 2 + st["routed"] * K * 2 + extra_bytes
 
     def allocfloor():
         b = torch.empty(nbytes, dtype=torch.uint8)
         b.view(-1)[::4096] = 1
 
-    return dict(mode0=fused(0), mode2=fused(2), mode3=fused(3), allocfloor=allocfloor,
-                unfused=unfused(), unfused_alloc=unfused(alloc=True))
+    def routing_prep():
+        ops.moe_routing_prep_cpu(st["tid"], E)
+
+    r = dict(mode0=fused(0), mode2=fused(2), mode3=fused(3), allocfloor=allocfloor,
+             unfused=unfused(), unfused_bare=unfused(alloc=False, prep=False))
+    if has_prep:
+        r["routing_prep"] = routing_prep
+    return r
 
 
 def instance(idx, cores, barrier, q, a):
@@ -252,7 +295,8 @@ def main():
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--iters", type=int, default=9)
     p.add_argument("--seed", type=int, default=4242)
-    p.add_argument("--rungs", default="mode0,mode2,mode3,unfused")
+    p.add_argument("--rungs",
+                   default="mode0,mode2,mode3,unfused,allocfloor,routing_prep")
     p.add_argument("--skip-first-core", action="store_true")
     p.add_argument("--interleave", action="store_true")
     p.add_argument("--arena-gib", type=int, default=4)
