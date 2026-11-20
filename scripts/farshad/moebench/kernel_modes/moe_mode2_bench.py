@@ -1,46 +1,41 @@
 #!/usr/bin/env python3
-"""Price each thing the fused MoE kernel does that an unfused decomposition does not.
+"""Price each thing the fused MoE kernel does beyond the matmuls themselves.
 
-One process, same weights / activation / warmup / iteration count:
+One process, same weights / activation / warmup, one WALL BUDGET per rung:
 
     mode0     fused_experts_cpu(expert_batching_mode=0)  -- as it ships
     mode2     fused_experts_cpu(expert_batching_mode=2)  -- minus gather and reduce
     mode3     fused_experts_cpu(expert_batching_mode=3)  -- minus the scatter as well
-    unfused   routing prep + per-call alloc + bmm_cpu + silu(gate)*up + bmm_cpu
-    unfused_bare   the same without the routing prep or the per-call alloc
+    *_hoist   the same three with routing_buffer + workspace handed in by the caller
+    allocfloor / routing_prep   the per-call at::empty and the routing sort, on their own
 
     mode0 - mode2   the gather's row copy + the [M,topk,K]->[M,K] topk reduce
     mode2 - mode3   the topk-weighted scatter: gemm2's permuted store back to routed-slot
-                    order, which mode 2 still pays and the unfused rung never does
-    unfused / mode3 the two implementations with every term that is not the matmul or the
-                    activation fusion held out of, or charged to, BOTH sides
+                    order, which mode 2 still pays
 
-Two steps used to sit on the fused side only, and both are now on the unfused rung as well:
-the routing sort (`moe_routing_prep_cpu`, the identical function fused_experts_cpu calls --
-the harness's precomputed buckets are a shortcut a real unfused route does not get), and the
-per-call allocation of the intermediates plus a block matching out_hidden_states and the
-thread scratch, first-touched, since what that costs is page faults and not the malloc.
-`allocfloor` and `routing_prep` price those two on their own; `unfused_bare` shows the leg
-without them.
+THE NON-FUSED REFERENCE IS BENCHDNN, AND THERE IS NO UNFUSED RUNG IN HERE. Owner's call,
+2026-10-07: the comparable to the fused-sglang table is the per-layer sum of benchdnn's own
+matmul kernels. The `unfused`/`unfused_bare` rungs were REMOVED, not just disabled -- besides
+being the wrong reference they actively corrupted the fused numbers, because the rungs are
+interleaved inside one iteration loop and their per-iteration buffer allocations churned the
+glibc arena for every OTHER rung timed beside them. Dropping them cut rt_decode's mode0 from
+0.206 to 0.056 ms. Removing them also removes the per-bucket weight packing from setup.
+
+To be comparable with benchdnn the sampling has to match it, so each rung gets `--budget-ms`
+of wall time (benchdnn's `--max-ms-per-prb`, 2000 by default) rather than a fixed call count.
+
+The three instances are three COPIES of the same kernel run at once, to measure a kernel on a
+BUSY socket -- they are not TP ranks and nothing waits for a peer. So across instances the
+reduction is the MEDIAN (the representative domain under load), after taking each instance's
+own min across iterations (benchdnn's min_time convention). The benchdnn rollup must reduce
+its three SNC nodes the same way or the ratio compares two different statistics.
 
 What is left on one side only is the SwiGLU fusion, deliberately: the fused kernel keeps
-gate|up in its fp32 accumulator and stores bf16 straight out of `silu_and_mul_stub`, where
-the decomposition has to materialise `h` and read it back. That is a real property of the
-two implementations, so it stays counted.
+gate|up in its fp32 accumulator and stores bf16 straight out of `silu_and_mul_stub`. That
+is a real property of the implementation, so it stays counted.
 
-The unfused rung issues ONE bmm_cpu pair per bucket over all its experts, which is the
-shape set the projection models: its benchdnn cases are `<G>x<tokens>x2048:<G>x2048x1024`,
-one batched matmul per bucket with the batch dim equal to the bucket's expert count. There
-is deliberately no chunked variant -- nothing upstream chunks, so a chunked rung would be
-measuring an implementation nobody has.
-
-Its h / act / y buffers are full [M*topk, *] slabs, matching the fused kernel's ic1/ic2.
-Its A is the honest pre-gathered [G, tokens, K], which is topk times the [M, K] that mode
-2 and 3 read their activation slices out of -- an asymmetry that stays, because a
-pre-gathered batch is what the unfused route actually holds.
-
-Routing is built with exact per-expert token counts so the unfused rung can batch each
-count into one bmm_cpu call; every fused mode sees the identical routing table.
+Routing is the REAL per-layer expert histogram, read from the archbench expert-stats CSVs
+through moe_stats at the revision the projection uses; every rung sees the identical table.
 """
 import argparse, json, os, statistics, sys, time
 import multiprocessing as mp
@@ -50,24 +45,64 @@ import multiprocessing as mp
 FULL = {0: (0, 32), 1: (32, 64), 2: (64, 96)}
 
 E, K, TOPK = 256, 2048, 8
-N = 512  # per-regime; set by instance() before any build
+N = 512  # per-lane; set by instance() before any build
+MOE_INTERMEDIATE_SIZE = 512
 
-REGIMES = {
-    # name: (num_tokens, per-expert token counts as {count: n_experts}, N)
-    "decode": (72, {1: 64, 2: 64, 3: 64, 6: 32}, 512),
-    "prefill": (16384, {512: 256}, 512),
-    "prefill_hot": (32768, {32768: 8}, 512),
-    # 8192 tokens/expert across all 256 experts: the "tens of thousands per expert"
-    # end WITHOUT concentrating routing onto a handful of experts. ~29 GiB/instance.
-    "prefill_big": (262144, {8192: 256}, 512),
-    # The four cells run on DMR (224c, SNC OFF, 4x56c), replayed here. rt is TP4, so
-    # N = 512/4; thr is TP1 at the full N. Counts are balanced rather than the run's real
-    # histogram, because the unfused rung needs equal-token buckets to batch a bmm_cpu.
-    "dmr_rt_decode": (1, {1: 8}, 128),
-    "dmr_rt_prefill": (1024, {32: 256}, 128),
-    "dmr_thr_decode": (320, {10: 256}, 512),
-    "dmr_thr_prefill": (327680, {10240: 256}, 512),
+#   lane: (phase, batch, tp).  N is MOE_INTERMEDIATE_SIZE / tp -- rt is TP4, thr is TP1.
+# The per-expert token counts are NOT synthetic: they are read per LAYER from the archbench
+# expert-stats CSVs through moe_stats, the same reader and the same pinned stats revision
+# the projection uses. (The balanced histograms that used to live here existed only so the
+# unfused rung could batch each bucket into one bmm_cpu call. There is no unfused rung any
+# more -- benchdnn is the non-fused reference -- so nothing forces equal-token buckets and
+# the real distribution is used directly.)
+LANES = {
+    "rt_decode":   ("decode", 1, 4),
+    "rt_prefill":  ("prefill", 1, 4),
+    "thr_decode":  ("decode", 320, 1),
+    "thr_prefill": ("prefill", 320, 1),
 }
+STATS_FILES = {
+    "decode": "qwen3.5-35B-A3B_realprompt_decode.csv",
+    "prefill": "qwen3.5-35B-A3B_realprompt_prefill_5buckets.csv",
+}
+
+
+def lane_histogram(lane, layer, stats_dir):
+    """(num_tokens, {tokens_per_expert: n_experts}, N, slack) for one lane, one layer."""
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+    import collections
+    import moe_stats
+
+    phase, batch, tp = LANES[lane]
+    csv_path = os.path.join(stats_dir, STATS_FILES[phase])
+    hist = moe_stats.read_histogram(csv_path, phase, batch, layer)
+    if not hist:
+        raise SystemExit(f"no histogram for lane={lane} layer={layer} in {csv_path}")
+    # Decode mass is exact; prefill is a 5-bucket average and only has to land in the band.
+    moe_stats.validate(hist, E, batch * TOPK if phase == "decode" else None, phase,
+                       f"{lane} layer {layer}")
+    # Expand to per-expert counts so prefill's non-topk-divisible mass gets its slack
+    # applied, then fold back to a histogram, which is what routing() consumes.
+    counts, num_tokens, slack = moe_stats.expert_token_counts(hist, E, TOPK)
+    folded = dict(collections.Counter(c for c in counts if c > 0))
+    return num_tokens, folded, MOE_INTERMEDIATE_SIZE // tp, slack
+
+
+def instance_cache_mib(cores):
+    """L2 + L3 MiB visible to these cores, read from sysfs: each distinct cache (by its
+    shared_cpu_list) counted once. On DMRX4 one 56-core SNC node is 28 x 4 MiB L2 + 320 MiB L3."""
+    seen = {}
+    for c in cores:
+        for idx in ("index2", "index3"):
+            d = f"/sys/devices/system/cpu/cpu{c}/cache/{idx}"
+            try:
+                key = (idx, open(f"{d}/shared_cpu_list").read().strip())
+                size = open(f"{d}/size").read().strip()
+            except OSError:
+                continue
+            unit = {"K": 1 / 1024, "M": 1, "G": 1024}[size[-1]]
+            seen[key] = float(size[:-1]) * unit
+    return sum(seen.values())
 
 
 def routing(num_tokens, counts, topk):
@@ -92,19 +127,7 @@ def routing(num_tokens, counts, topk):
     return torch.tensor(rows, dtype=torch.int32)
 
 
-def buckets_of(counts, topk_ids):
-    """{token_count: [expert ids]} plus each expert's row slice into the sorted layout."""
-    import torch
-
-    per_expert = torch.bincount(topk_ids.flatten().to(torch.int64), minlength=E)
-    out = {}
-    for c in sorted(counts):
-        ids = (per_expert == c).nonzero().flatten().tolist()
-        out[c] = ids
-    return out
-
-
-def build(num_tokens, counts, seed, ops):
+def build(num_tokens, counts, seed, ops, copies=1):
     import torch
 
     g = torch.Generator().manual_seed(seed)
@@ -115,31 +138,19 @@ def build(num_tokens, counts, seed, ops):
     w2 = (torch.randn((E, K, N), generator=g, dtype=torch.float32) / 24).to(torch.bfloat16)
 
     routed = num_tokens * TOPK
-    # Full-size slabs, so the unfused rung's output footprint matches the fused ic1/ic2.
-    hbuf = torch.empty((routed, 2 * N), dtype=torch.bfloat16).uniform_(-1, 1, generator=g)
-    actbuf = torch.empty((routed, N), dtype=torch.bfloat16).uniform_(-1, 1, generator=g)
-    ybuf = torch.empty((routed, K), dtype=torch.bfloat16).uniform_(-1, 1, generator=g)
-    silubuf = torch.empty((routed, N), dtype=torch.bfloat16).uniform_(-1, 1, generator=g)
-
     # fused_experts_cpu repacks w1/w2 on EVERY call unless is_vnni=True, and that repack is
     # 60-96% of its runtime here -- so pack once at setup and pass is_vnni=True, matching how
-    # the unfused rung gets its weights and how bench_moe_cpu.py's --prepack default runs.
+    # bench_moe_cpu.py's --prepack default runs. w1 is [E, 2N, K] and w2 is [E, K, N], both
+    # already output-channel-major, which is the layout convert_weight_packed wants.
     pw1 = ops.convert_weight_packed(w1)
     pw2 = ops.convert_weight_packed(w2)
+    # COLD WEIGHTS: `copies` private packed weight sets, and every fused call -- whatever the
+    # rung -- takes the NEXT one from one shared counter. With copies-1 other sets walked in
+    # between, a set's weights have been evicted from L2+L3 by the time it is used again, the
+    # way the 39 other layers evict them end to end. copies=1 is the old warm-weight bench.
+    # Same scheme as bench_moe_cpu.py --copies (make_fused_runner).
+    wsets = [(pw1, pw2)] + [(pw1.clone(), pw2.clone()) for _ in range(copies - 1)]
 
-    # w1 is [E, 2N, K] and w2 is [E, K, N] -- both already output-channel-major, which is
-    # the layout convert_weight_packed wants, so no transpose here.
-    work = []
-    for c, ids in buckets_of(counts, tid).items():
-        if not ids:
-            continue
-        sel = torch.tensor(ids, dtype=torch.int64)
-        p1 = ops.convert_weight_packed(w1.index_select(0, sel).contiguous())
-        p2 = ops.convert_weight_packed(w2.index_select(0, sel).contiguous())
-        # The honest pre-gathered batch: one [G, tokens, K] A per bucket, which is what a
-        # single bmm_cpu call over the bucket's experts consumes.
-        a = torch.empty((len(ids), c, K), dtype=torch.bfloat16).uniform_(-1, 1, generator=g)
-        work.append(dict(c=c, G=len(ids), p1=p1, p2=p2, a=a))
     # Pre-built routing buffer and workspace for the hoisted rungs. The workspace is sized
     # generously (the kernel only checks >=) and first-touched here, so its page faults are
     # paid at setup rather than inside the timed call.
@@ -151,8 +162,7 @@ def build(num_tokens, counts, seed, ops):
                 + nthreads * 2 * 32 * 32 * 4 + (1 << 20))
     ws = torch.empty(ws_bytes, dtype=torch.int8)
     ws.view(-1)[::4096] = 1
-    return dict(tid=tid, tw=tw, hs=hs, pw1=pw1, pw2=pw2, routed=routed, rbuf=rbuf, ws=ws,
-                hbuf=hbuf, actbuf=actbuf, ybuf=ybuf, silubuf=silubuf, work=work)
+    return dict(tid=tid, tw=tw, hs=hs, wsets=wsets, ctr=[0], routed=routed, rbuf=rbuf, ws=ws)
 
 
 def make_rungs(st, ops):
@@ -173,65 +183,30 @@ def make_rungs(st, ops):
         else is untouched, which is what makes mode3 - mode3(hoist) their measured cost."""
         if hoist and (not has_hoist or st["rbuf"] is None):
             return None
-        args = [st["hs"], st["pw1"], st["pw2"], st["tw"], st["tid"], bool(hoist), 0,
-                None, None, None, None, None, None, None, None, None, True, None]
-        # the pristine build predates expert_batching_mode; its schema takes 18 args
-        if has_mode:
-            args = args + [mode]
-        elif mode != 0:
+        if not has_mode and mode != 0:
             return None
-        if has_hoist:
-            args = args + ([st["rbuf"], st["ws"]] if hoist else [None, None])
+        argsets = []
+        for pw1, pw2 in st["wsets"]:
+            args = [st["hs"], pw1, pw2, st["tw"], st["tid"], bool(hoist), 0,
+                    None, None, None, None, None, None, None, None, None, True, None]
+            # the pristine build predates expert_batching_mode; its schema takes 18 args
+            if has_mode:
+                args = args + [mode]
+            if has_hoist:
+                args = args + ([st["rbuf"], st["ws"]] if hoist else [None, None])
+            argsets.append(args)
+        ctr = st["ctr"]  # ONE counter shared by every rung, so interleaved rungs stay cold
 
         def run():
-            fe(*args)
+            fe(*argsets[ctr[0] % len(argsets)])
+            ctr[0] += 1
         return run
 
     has_prep = hasattr(ops, "moe_routing_prep_cpu")
     # fused_experts_cpu allocates out_hidden_states plus the thread scratch (A_tmp, C_tmp)
-    # that ic1/ic2 do not correspond to; charging the unfused side an equal-sized block, and
-    # FIRST TOUCHING it, is what makes the two pay the same page-fault work. The cost is the
-    # faults, not the malloc, so an untouched torch.empty would be free and match nothing.
+    # on top of ic1/ic2. What that costs is the FIRST TOUCH, not the malloc, so allocfloor
+    # has to touch every page -- an untouched torch.empty would be free and match nothing.
     extra_bytes = M * K * 2 + nthreads * 32 * K * 2 + nthreads * 2 * 32 * 32 * 4
-
-    def unfused(alloc=True, prep=True):
-        """The decomposition, charged the two steps only the fused side used to pay.
-
-        `prep` runs the SAME routing sort fused_experts_cpu runs; the harness's buckets are
-        precomputed at setup, which a real unfused route could not do. `alloc` allocates the
-        intermediates per call instead of reusing setup buffers, as fused_experts_cpu does.
-        Both default ON: with them the two legs' op lists differ only in the SwiGLU fusion.
-        """
-        def run():
-            if prep and has_prep:
-                ops.moe_routing_prep_cpu(st["tid"], E)
-            if alloc:
-                hb = torch.empty((st["routed"], 2 * N), dtype=torch.bfloat16)
-                ab = torch.empty((st["routed"], N), dtype=torch.bfloat16)
-                yb = torch.empty((st["routed"], K), dtype=torch.bfloat16)
-                sb = torch.empty((st["routed"], N), dtype=torch.bfloat16)
-                extra = torch.empty(extra_bytes, dtype=torch.uint8)
-                extra.view(-1)[::4096] = 1
-            else:
-                hb, ab, yb, sb = st["hbuf"], st["actbuf"], st["ybuf"], st["silubuf"]
-            base = 0
-            for wk in st["work"]:
-                c, G, p1, p2 = wk["c"], wk["G"], wk["p1"], wk["p2"]
-                rows = G * c
-                h = hb[base:base + rows].view(G, c, 2 * N)
-                ops.bmm_cpu(h, wk["a"], p1, True, None)
-                gate, up = h.chunk(2, dim=-1)
-                act = ab[base:base + rows].view(G, c, N)
-                # silu(gate) * up without F.silu's per-call temporary: that temporary was an
-                # allocation inside the timed loop that the fused side does not have.
-                s = sb[base:base + rows].view(G, c, N)
-                torch.sigmoid(gate, out=s)
-                s.mul_(gate)
-                torch.mul(s, up, out=act)
-                y = yb[base:base + rows].view(G, c, K)
-                ops.bmm_cpu(y, act, p2, True, None)
-                base += rows
-        return run
 
     # what fused_experts_cpu's own at::empty costs: same byte count, same first touch
     nbytes = st["routed"] * N * 2 + st["routed"] * K * 2 + extra_bytes
@@ -243,16 +218,16 @@ def make_rungs(st, ops):
     def routing_prep():
         ops.moe_routing_prep_cpu(st["tid"], E)
 
-    r = dict(mode0=fused(0), mode2=fused(2), mode3=fused(3), allocfloor=allocfloor,
-             unfused=unfused(), unfused_bare=unfused(alloc=False, prep=False))
+    r = dict(mode0=fused(0), mode2=fused(2), mode3=fused(3), allocfloor=allocfloor)
     if has_prep:
         r["routing_prep"] = routing_prep
     # The subtractive ladder: each rung removes ONE more step from the real kernel, so its
     # cost is measured in situ. Subtracting the standalone `allocfloor` / `routing_prep`
     # instead would over-count -- at bs1 those two alone already exceed mode0.
-    # The whole ladder is also available hoisted, which is the only way to run it at the big
-    # prefill shapes: there the per-call workspace is 13.4 GiB and its page faults are 57% of
-    # mode 0, so the un-hoisted differences are page faults rather than kernel work.
+    # The hoisted variants are available but are NOT in the default rung list: hoisting is not
+    # "mode0 minus the allocation", it penalises the modes that do the permuted store into ic2
+    # (thr_prefill mode0 +23%, mode2 +14%) while helping mode3 (-7%), so it changes the
+    # kernel's memory behaviour rather than isolating one term.
     for name, fn in (("mode0_hoist", fused(0, hoist=True)),
                      ("mode2_hoist", fused(2, hoist=True)),
                      ("mode3_hoist", fused(3, hoist=True))):
@@ -261,7 +236,7 @@ def make_rungs(st, ops):
     return r
 
 
-def instance(idx, cores, barrier, q, a):
+def instance(idx, cores, barrier, q, a, nit):
     os.sched_setaffinity(0, set(cores))
     os.environ["OMP_NUM_THREADS"] = str(len(cores))
     sys.path.insert(0, a.so_dir)
@@ -281,24 +256,47 @@ def instance(idx, cores, barrier, q, a):
 
     ops = torch.ops.sgl_kernel
     global N
-    num_tokens, counts, N = REGIMES[a.regime]
-    st = build(num_tokens, counts, a.seed + idx, ops)
+    num_tokens, counts, N, slack = lane_histogram(a.lane, a.layer, a.stats_dir)
+    st = build(num_tokens, counts, a.seed + idx, ops, a.copies)
+    # bytes ONE call reads from the weights: only the routed experts' rows are touched
+    touched = sum(counts.values()) * (2 * N * K + K * N) * 2
     rungs = make_rungs(st, ops)
     names = [n for n in a.rungs.split(",") if rungs.get(n) is not None]
     # Warm every rung before timing any of them: oneDNN init and OMP thread wake-up are
-    # one-time, and whichever rung ran first would otherwise absorb all of it.
+    # one-time, and whichever rung ran first would otherwise absorb all of it. The warmup is
+    # also timed, to size the measured loop the way benchdnn sizes its own: a per-rung WALL
+    # BUDGET rather than a fixed call count, so a 0.1 ms rung and an 800 ms rung each get a
+    # comparable amount of sampling instead of a comparable number of calls.
+    est = {}
     for nm in names:
+        t0 = time.perf_counter()
         for _ in range(a.warmup):
             rungs[nm]()
+        est[nm] = (time.perf_counter() - t0) * 1000 / max(1, a.warmup)
+
+    # The iteration counts MUST be identical across instances: every timed call sits behind a
+    # barrier, so an instance that ran one more or one fewer would hang its peers. Instance 0
+    # sizes them from its own estimate and publishes; everyone reads the same array.
+    if idx == 0:
+        for i, nm in enumerate(names):
+            n = int(a.budget_ms / est[nm]) if est[nm] > 0 else a.max_iters
+            nit[i] = max(a.min_iters, min(a.max_iters, n))
+    barrier.wait()
+    iters = {nm: nit[i] for i, nm in enumerate(names)}
+
     samples = {nm: [] for nm in names}
     if a.interleave:
         # Round-robin the rungs INSIDE the iteration loop, so a drift over the run (AMX
         # frequency ramp, page placement settling, allocator growth) lands on every rung
-        # equally instead of on whichever one is timed first.
+        # equally instead of on whichever one is timed first. A rung whose budget is already
+        # spent is skipped -- the schedule is a pure function of the shared `iters`, so every
+        # instance skips the same rung in the same round and the barriers stay aligned.
         barrier.wait()
-        for it in range(a.iters):
+        for it in range(max(iters.values())):
             order = names if it % 2 == 0 else names[::-1]
             for nm in order:
+                if it >= iters[nm]:
+                    continue
                 barrier.wait()
                 t0 = time.perf_counter()
                 rungs[nm]()
@@ -306,28 +304,43 @@ def instance(idx, cores, barrier, q, a):
     else:
         for nm in names:
             barrier.wait()
-            for _ in range(a.iters):
+            for _ in range(iters[nm]):
                 barrier.wait()
                 t0 = time.perf_counter()
                 rungs[nm]()
                 samples[nm].append((time.perf_counter() - t0) * 1000)
-    out = {nm: dict(median_ms=statistics.median(v), min_ms=min(v), max_ms=max(v))
-           for nm, v in samples.items()}
-    hist = {wk["c"]: wk["G"] for wk in st["work"]}
-    q.put((idx, dict(out, _meta=dict(cores=len(cores), num_tokens=num_tokens,
-                                     routed=st["routed"], hist=hist))))
+    out = {nm: dict(median_ms=statistics.median(v), min_ms=min(v), max_ms=max(v),
+                    iters=len(v), est_ms=est[nm]) for nm, v in samples.items()}
+    q.put((idx, dict(out, _meta=dict(cores=len(cores), num_tokens=num_tokens, N=N,
+                                     routed=st["routed"], hist=counts, slack=slack,
+                                     active_experts=sum(counts.values()), copies=a.copies,
+                                     touched_mib=touched / 2**20,
+                                     reuse_distance_mib=(a.copies - 1) * touched / 2**20,
+                                     cache_mib=instance_cache_mib(cores)))))
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--so-dir", default="/tmp/moe_cm_mode2")
-    p.add_argument("--regime", default="prefill", choices=sorted(REGIMES))
+    p.add_argument("--lane", default="rt_prefill", choices=sorted(LANES))
+    p.add_argument("--layer", type=int, default=0, help="which MoE layer's real histogram")
+    p.add_argument("--stats-dir", default="/home/farshad/.cache/moebench/archbench/files/"
+                   "5ae86154d545244f6239bf966aeb694899fe53ab/tools/cpu/config/qwen35/expert_stats",
+                   help="archbench expert_stats dir; the pinned revision the projection uses")
     p.add_argument("--instances", type=int, default=3)
+    p.add_argument("--copies", type=int, default=1,
+                   help="packed weight sets rotated per call; 1 = warm weights. Pick it so "
+                        "(copies-1) x touched MiB exceeds the instance's L2+L3 (cold weights)")
+    p.add_argument("--cores-per-instance", type=int, default=32,
+                   help="one instance per SNC domain: GNR 32, DMRX4 56")
     p.add_argument("--warmup", type=int, default=3)
-    p.add_argument("--iters", type=int, default=9)
+    # Matches benchdnn's --max-ms-per-prb: give every rung the same wall budget, not the same
+    # call count, so the two sides are sampled the same way before their mins are compared.
+    p.add_argument("--budget-ms", type=float, default=2000.0)
+    p.add_argument("--min-iters", type=int, default=3)
+    p.add_argument("--max-iters", type=int, default=5000)
     p.add_argument("--seed", type=int, default=4242)
-    p.add_argument("--rungs",
-                   default="mode0,mode2,mode3,unfused,allocfloor,routing_prep")
+    p.add_argument("--rungs", default="mode0,mode2,mode3,allocfloor,routing_prep")
     p.add_argument("--skip-first-core", action="store_true")
     p.add_argument("--interleave", action="store_true")
     p.add_argument("--arena-gib", type=int, default=4)
@@ -354,8 +367,11 @@ def main():
     ctx = mp.get_context("spawn")
     barrier = ctx.Barrier(a.instances)
     q = ctx.Queue()
-    ranges = {k: range(lo + (1 if a.skip_first_core else 0), hi) for k, (lo, hi) in FULL.items()}
-    procs = [ctx.Process(target=instance, args=(i, list(ranges[i]), barrier, q, a))
+    c = a.cores_per_instance
+    ranges = {i: range(i * c + (1 if a.skip_first_core else 0), (i + 1) * c)
+              for i in range(a.instances)}
+    nit = ctx.Array("i", len(a.rungs.split(",")))
+    procs = [ctx.Process(target=instance, args=(i, list(ranges[i]), barrier, q, a, nit))
              for i in range(a.instances)]
     for pr in procs:
         pr.start()
@@ -364,39 +380,63 @@ def main():
         pr.join()
 
     m = got[0]["_meta"]
-    print(f"regime={a.regime} K={K} N={REGIMES[a.regime][2]} E={E} topk={TOPK} tokens={m['num_tokens']} "
-          f"routed={m['routed']} tokens_per_expert={m['hist']} "
-          f"instances={a.instances}x{m['cores']}c iters={a.iters}")
-    print(f"{'rung':14s} {'median ms':>11s} {'min ms':>10s} {'worst/med':>10s}")
+    ph, bs, tp = LANES[a.lane]
+    print(f"lane={a.lane} layer={a.layer} phase={ph} batch={bs} tp={tp} K={K} N={m['N']} "
+          f"E={E} topk={TOPK} tokens={m['num_tokens']} routed={m['routed']} "
+          f"active_experts={m['active_experts']} slack={m['slack']} "
+          f"instances={a.instances}x{m['cores']}c budget={a.budget_ms:.0f}ms/rung")
+    print(f"  weights: copies={m['copies']} touched/call={m['touched_mib']:.1f} MiB "
+          f"reuse distance={m['reuse_distance_mib']:.0f} MiB  "
+          f"instance L2+L3={m['cache_mib']:.0f} MiB")
+    # End to end, each MoE layer's weights are evicted by the other 39 layers before that
+    # layer runs again, so they come from DDR. A reuse distance that fits the instance's
+    # L2+L3 lets the weights stay cache-resident between calls, which is not that.
+    warm = m["reuse_distance_mib"] <= m["cache_mib"]
+    if warm:
+        print(f"WARNING: WEIGHTS ARE CACHE-RESIDENT. --copies {m['copies']} gives a reuse distance "
+              f"of {m['reuse_distance_mib']:.0f} MiB <= the instance's L2+L3 "
+              f"({m['cache_mib']:.0f} MiB), so the weights stay in cache between calls. That is "
+              f"NOT how end-to-end inference runs the MoE layers: there each layer's weights are "
+              f"evicted by the other 39 layers and come from DDR. Raise --copies above "
+              f"{1 + m['cache_mib'] / m['touched_mib']:.0f} for DDR-resident weights.")
+    print(f"  real histogram {{tokens_per_expert: n_experts}} = {m['hist']}")
+    # `best_ms`: each instance's own min across iterations (benchdnn's min_time convention),
+    # reduced across instances by the MEDIAN. The three instances are three copies of the same
+    # kernel loading the socket, not TP ranks -- nothing waits for a peer -- so the question
+    # they answer is "what does this kernel cost on a busy socket", and the representative
+    # domain is the median one. `max` would report the unluckiest domain; `min` would report
+    # the luckiest and so partly undo the loading the three instances exist to create.
+    # The benchdnn rollup applies the identical reduction over its three SNC nodes.
+    print(f"{'rung':14s} {'best ms':>10s} {'median ms':>11s} {'worst/med':>10s} {'iters':>7s}")
     res = {}
     for nm in [n for n in a.rungs.split(",") if n in got[0]]:
         med = [got[i][nm]["median_ms"] for i in got]
+        mins = [got[i][nm]["min_ms"] for i in got]
         mm = statistics.median(med)
-        res[nm] = dict(median_ms=mm, min_ms=statistics.median([got[i][nm]["min_ms"] for i in got]),
-                       imb=max(med) / mm, per_instance=med)
-        print(f"{nm:14s} {mm:>11.3f} {res[nm]['min_ms']:>10.3f} {res[nm]['imb']:>10.3f}")
+        res[nm] = dict(best_ms=statistics.median(mins), median_ms=mm, min_ms=min(mins),
+                       max_ms=max(mins), imb=max(med) / mm,
+                       iters=got[0][nm]["iters"], per_instance=med, per_instance_min=mins)
+        print(f"{nm:14s} {res[nm]['best_ms']:>10.3f} {mm:>11.3f} {res[nm]['imb']:>10.3f} "
+              f"{res[nm]['iters']:>7d}")
 
-    m0 = res.get("mode0", {}).get("median_ms")
+    m0 = res.get("mode0", {}).get("best_ms")
     for lo, hi, what in (("mode2", "mode0", "the gather's row copy + the topk reduce"),
                          ("mode3", "mode2", "the topk-weighted scatter"),
-                         ("mode3", "mode0", "all three, i.e. everything unfused does not do")):
+                         ("mode3", "mode0", "all three: gather + topk reduce + weighted scatter")):
         if lo in res and hi in res:
-            d = res[hi]["median_ms"] - res[lo]["median_ms"]
+            d = res[hi]["best_ms"] - res[lo]["best_ms"]
             print(f"\n{hi} - {lo}   = {d:>9.3f} ms  ({100 * d / m0:+.1f}% of mode0)  -- {what}")
-    for nm in ("mode0", "mode2", "mode3"):
-        if "unfused" in res and nm in res:
-            print(f"unfused / {nm} = {res['unfused']['median_ms'] / res[nm]['median_ms']:>7.3f}x"
-                  + ("   <-- the matmul comparison, all three terms out of both sides"
-                     if nm == "mode3" else ""))
     # An allocation-dominated cell makes every mode difference unattributable, and that is
     # not visible from the mode numbers themselves -- it has to be said out loud.
     if "allocfloor" in res and m0:
-        frac = res["allocfloor"]["median_ms"] / m0
+        frac = res["allocfloor"]["best_ms"] / m0
         warn = ("   <-- ALLOCATION-DOMINATED: the fused rungs are timing page faults, not "
                 "the kernel. Do not quote the mode differences." if frac > 0.25 else "")
         print(f"\nallocfloor / mode0 = {frac:.1%}{warn}")
     if a.out_json:
-        json.dump(dict(regime=a.regime, meta=m, malloc_tune=a.malloc_tune, rungs=res),
+        json.dump(dict(lane=a.lane, layer=a.layer, phase=ph, batch=bs, tp=tp,
+                       weights_cache_resident=warm,
+                       stats_dir=a.stats_dir, meta=m, malloc_tune=a.malloc_tune, rungs=res),
                   open(a.out_json, "w"), indent=2)
 
 

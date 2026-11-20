@@ -282,3 +282,6 @@ artifacts/
 
 # Internal, non-published docs
 internal-docs/
+
+# Claude scratch: drivers, logs, audit scripts. Never committed.
+_claude/
